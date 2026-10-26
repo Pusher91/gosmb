@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jfjallid/go-smb/smb"
+	smb "gosmb/internal/smbwire"
 )
 
 func permissionContext(name string, data []byte) []byte {
@@ -45,56 +45,6 @@ func permissionContextList(entries ...[]byte) []byte {
 		buf = append(buf, entry...)
 	}
 	return buf
-}
-
-func TestAddMaximalAccessContextReadOnlyWireRequest(t *testing.T) {
-	s := &smb.Session{}
-	req, err := s.NewCreateReq("share", "", smb.OpLockLevelNone,
-		smb.ImpersonationLevelImpersonation, smb.DAccMaskFileListDirectory,
-		smb.FileAttrDirectory, smb.FileShareRead|smb.FileShareWrite|smb.FileShareDelete,
-		smb.FileOpen, smb.FileDirectoryFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := addMaximalAccessContext(&req); err != nil {
-		t.Fatal(err)
-	}
-	wire, err := req.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got smb.CreateReq
-	if err := got.UnmarshalBinary(wire); err != nil {
-		t.Fatal(err)
-	}
-	if got.DesiredAccess != smb.DAccMaskFileListDirectory || got.CreateDisposition != smb.FileOpen || got.CreateOptions != smb.FileDirectoryFile {
-		t.Fatalf("context changed the read-only open: access=%#x disposition=%#x options=%#x", got.DesiredAccess, got.CreateDisposition, got.CreateOptions)
-	}
-	if got.NameLength != 0 || got.NameOffset != 120 || got.CreateContextsOffset != 128 || got.CreateContextsLength != 24 {
-		t.Fatalf("incorrect root CREATE wire layout: name=%d/%d contexts=%d/%d", got.NameOffset, got.NameLength, got.CreateContextsOffset, got.CreateContextsLength)
-	}
-	ctx := wire[got.CreateContextsOffset:]
-	if len(ctx) != 24 || string(ctx[16:20]) != "MxAc" || binary.LittleEndian.Uint32(ctx[:4]) != 0 || binary.LittleEndian.Uint32(ctx[12:16]) != 0 {
-		t.Fatal("expected exactly one maximal-access request without a timestamp")
-	}
-}
-
-func TestAddMaximalAccessContextRejectsNonRootOrExistingContexts(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		req  *smb.CreateReq
-	}{
-		{"nil", nil},
-		{"named file", &smb.CreateReq{NameLength: 2}},
-		{"existing offset", &smb.CreateReq{CreateContextsOffset: 128}},
-		{"existing length", &smb.CreateReq{CreateContextsLength: 24}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := addMaximalAccessContext(tc.req); err == nil {
-				t.Fatal("expected rejection")
-			}
-		})
-	}
 }
 
 func TestParseMaximalAccess(t *testing.T) {

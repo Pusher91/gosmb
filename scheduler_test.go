@@ -290,6 +290,21 @@ func TestSchedulerOutputFailureCancelsActiveWorkers(t *testing.T) {
 	}
 }
 
+func TestSchedulerShortOutputStopsQueuedStarts(t *testing.T) {
+	var diagnostics bytes.Buffer
+	deps := testCLIDeps(shortOutputWriter{}, &diagnostics)
+	calls := 0
+	deps.scan = func(_ context.Context, target Target, _ Options) Result {
+		calls++
+		return schedulerSuccess(target)
+	}
+	targets := schedulerHostFile(t, "first", "queued")
+	code := runCLI(context.Background(), []string{targets, "-u", "alice", "-p", "", "--no-header", "--delay=0"}, deps)
+	if code != 1 || calls != 1 {
+		t.Fatalf("short output did not stop queued scans: exit=%d scans=%d", code, calls)
+	}
+}
+
 func TestSchedulerDelaySpacesAllConcurrentLaunches(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

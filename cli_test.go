@@ -15,7 +15,7 @@ import (
 )
 
 func TestParseCLIFlagsAfterTarget(t *testing.T) {
-	cfg, err := parseCLI([]string{"server.example:1445", "-u", `EXAMPLE\alice`, "-p", "", "--domain", "example", "--timeout", "7s", "--delay=0", "--json"})
+	cfg, err := parseCLI(context.Background(), []string{"server.example:1445", "-u", `EXAMPLE\alice`, "-p", "", "--domain", "example", "--timeout", "7s", "--delay=0", "--json"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestParseCLIFlagsAfterTarget(t *testing.T) {
 }
 
 func TestCLIConcurrencyAndHostTimeoutOptions(t *testing.T) {
-	cfg, err := parseCLI([]string{"server", "--guest"})
+	cfg, err := parseCLI(context.Background(), []string{"server", "--guest"})
 	if err != nil || cfg.concurrency != 1 || cfg.options.HostTimeout != 30*time.Second || cfg.options.Timeout != 10*time.Second {
 		t.Fatalf("unexpected scheduler defaults: %#v %v", cfg, err)
 	}
@@ -36,18 +36,18 @@ func TestCLIConcurrencyAndHostTimeoutOptions(t *testing.T) {
 		{"--concurrency", "1024", "server", "--guest", "--host-timeout", "1", "--timeout", "2s"},
 		{"server", "--concurrency=1024", "--host-timeout=1", "--timeout=2s", "--guest"},
 	} {
-		cfg, err = parseCLI(args)
+		cfg, err = parseCLI(context.Background(), args)
 		if err != nil || cfg.concurrency != 1024 || cfg.options.HostTimeout != time.Second || cfg.options.Timeout != 2*time.Second {
 			t.Fatalf("scheduler options were not parsed independently: %#v %v", cfg, err)
 		}
 	}
 	for _, value := range []string{"", "0", "-1", "1.5", "not-a-count", "999999999999999999999"} {
-		if _, err := parseCLI([]string{"server", "--guest", "--concurrency", value}); err == nil {
+		if _, err := parseCLI(context.Background(), []string{"server", "--guest", "--concurrency", value}); err == nil {
 			t.Errorf("accepted invalid concurrency %q", value)
 		}
 	}
 	for _, value := range []string{"", "0", "-1", "1.5", "1s", "not-a-count", "9223372037", "999999999999999999999"} {
-		if _, err := parseCLI([]string{"server", "--guest", "--host-timeout", value}); err == nil {
+		if _, err := parseCLI(context.Background(), []string{"server", "--guest", "--host-timeout", value}); err == nil {
 			t.Errorf("accepted invalid host timeout %q", value)
 		}
 	}
@@ -64,7 +64,7 @@ func TestParseIdentity(t *testing.T) {
 			t.Errorf("parseIdentity(%q): %q %q %v", tt.input, user, domain, err)
 		}
 	}
-	for _, tt := range [][2]string{{"", ""}, {`\alice`, ""}, {"alice@", ""}, {"@example", ""}, {`EXAMPLE\alice`, "OTHER"}, {"alice@example", "other"}, {"a@b@c", ""}, {"a\nb", ""}, {" alice", ""}} {
+	for _, tt := range [][2]string{{"", ""}, {`\alice`, ""}, {"alice@", ""}, {"@example", ""}, {`EXAMPLE\alice`, "OTHER"}, {"alice@example", "other"}, {"a@b@c", ""}, {"a\nb", ""}, {" alice", ""}, {"ali\xffce", ""}, {"alice", "dom\xffain"}, {"alice@dom\xffain", ""}} {
 		if _, _, err := parseIdentity(tt[0], tt[1]); err == nil {
 			t.Errorf("accepted malformed/conflicting identity %q", tt)
 		}
@@ -78,7 +78,8 @@ func TestParseTarget(t *testing.T) {
 	}{
 		{"fileserver", Target{"fileserver", 445}},
 		{"fileserver:1445", Target{"fileserver", 1445}},
-		{"Server.Example.", Target{"Server.Example", 445}},
+		{"Server.Example.", Target{"Server.Example.", 445}},
+		{"Fileserver.:1445", Target{"Fileserver.", 1445}},
 		{"192.0.2.10", Target{"192.0.2.10", 445}},
 		{"192.0.2.10:1445", Target{"192.0.2.10", 1445}},
 		{"2001:db8::1", Target{"2001:db8::1", 445}},
@@ -90,7 +91,7 @@ func TestParseTarget(t *testing.T) {
 		if err != nil || got != tt.want {
 			t.Errorf("parseTarget(%q) = %#v, %v; want %#v", tt.input, got, err, tt.want)
 		}
-		cfg, err := parseCLI([]string{tt.input, "--guest"})
+		cfg, err := parseCLI(context.Background(), []string{tt.input, "--guest"})
 		if err != nil || !reflect.DeepEqual(cfg.targets, []Target{tt.want}) {
 			t.Errorf("CLI target %q = %#v, %v; want %#v", tt.input, cfg.targets, err, tt.want)
 		}
@@ -104,14 +105,175 @@ func TestParseTarget(t *testing.T) {
 
 func TestTargetListBOMCommentsDedupAndPorts(t *testing.T) {
 	input := "\ufeff# hosts\r\n\n Server.Example \nserver.example:445\nserver.example:1445\n2001:db8::1\n[2001:0db8::1]:445\n"
-	got, err := parseTargetList(strings.NewReader(input))
+	got, err := parseTargetList(context.Background(), strings.NewReader(input))
 	want := []Target{{"Server.Example", 445}, {"server.example", 1445}, {"2001:db8::1", 445}}
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, %v; want %#v", got, err, want)
 	}
 	for _, input := range []string{"# nothing\n", "good\nbad:password-secret\n", "\xff\n", strings.Repeat("x", 70000)} {
-		if _, err := parseTargetList(strings.NewReader(input)); err == nil || strings.Contains(err.Error(), "password-secret") {
+		if _, err := parseTargetList(context.Background(), strings.NewReader(input)); err == nil || strings.Contains(err.Error(), "password-secret") {
 			t.Errorf("malformed list must fail without including values: %v", err)
+		}
+	}
+}
+
+type targetListReaderFunc func([]byte) (int, error)
+
+func (f targetListReaderFunc) Read(p []byte) (int, error) { return f(p) }
+
+func TestTargetListCancellationDiscardsPartialTargets(t *testing.T) {
+	for _, pending := range []string{"10.0.0.0/16\n", "# ignored\n", "0.0.0.0/0\n", ""} {
+		t.Run(pending, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			reads := 0
+			reader := targetListReaderFunc(func(p []byte) (int, error) {
+				reads++
+				if reads == 1 {
+					return copy(p, "first-server\n"), nil
+				}
+				if reads != 2 {
+					t.Fatal("continued reading after cancellation")
+				}
+				cancel()
+				return copy(p, pending), io.EOF
+			})
+			targets, err := parseTargetList(ctx, reader)
+			if !errors.Is(err, context.Canceled) || targets != nil || reads != 2 {
+				t.Fatalf("cancellation returned partial targets or wrong error: targets=%v reads=%d error=%v", targets, reads, err)
+			}
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	reader := targetListReaderFunc(func([]byte) (int, error) {
+		t.Fatal("already canceled parser read input")
+		return 0, io.EOF
+	})
+	if targets, err := parseTargetList(ctx, reader); targets != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("already canceled parser: targets=%v error=%v", targets, err)
+	}
+}
+
+func TestCLIParsingCancellationHasNoCredentialOrScanSideEffects(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hosts")
+	if err := os.WriteFile(path, []byte("0.0.0.0/0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, expired := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(context.Background())
+		if expired {
+			cancel()
+			ctx, cancel = context.WithDeadline(context.Background(), time.Unix(0, 0))
+		}
+		cancel()
+		var out, diagnostics bytes.Buffer
+		deps := testCLIDeps(&out, &diagnostics)
+		deps.lookupEnv = func(string) (string, bool) {
+			t.Fatal("canceled parsing accessed credentials")
+			return "", false
+		}
+		deps.prompt = func(context.Context, io.Reader, io.Writer) (string, error) {
+			t.Fatal("canceled parsing prompted for a password")
+			return "", nil
+		}
+		deps.scan = func(context.Context, Target, Options) Result {
+			t.Fatal("canceled parsing started a scan")
+			return Result{}
+		}
+		if code := runCLI(ctx, []string{path, "-u", "alice"}, deps); code != 1 || out.Len() != 0 || diagnostics.String() != "gosmb: canceled\n" {
+			t.Fatalf("canceled parsing: exit=%d stdout=%q stderr=%q", code, out.String(), diagnostics.String())
+		}
+	}
+}
+
+func TestAbsoluteAndRelativeHostnamesRemainDistinctTargets(t *testing.T) {
+	input := "Fileserver.\nfileserver\nFILESERVER.:445\nFILESERVER\n"
+	want := []Target{{"Fileserver.", 445}, {"fileserver", 445}}
+	got, err := parseTargetList(context.Background(), strings.NewReader(input))
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("absolute DNS name was altered or conflated with a relative name: %#v, %v", got, err)
+	}
+}
+
+func TestCLIMaximumLengthHostnameWithPort(t *testing.T) {
+	host := strings.Join([]string{strings.Repeat("a", 63), strings.Repeat("b", 63), strings.Repeat("c", 63), strings.Repeat("d", 61)}, ".")
+	for _, spelling := range []string{host, host + "."} {
+		for _, port := range []string{"445", "65535"} {
+			cfg, err := parseCLI(context.Background(), []string{spelling + ":" + port, "--guest"})
+			if err != nil || len(cfg.targets) != 1 || cfg.targets[0].String() != spelling+":"+port {
+				t.Fatalf("valid long endpoint was rejected as a filename: targets=%#v error=%v", cfg.targets, err)
+			}
+		}
+	}
+	for _, invalid := range []string{host + "x:445", strings.Repeat("a", 64) + ".example:445"} {
+		if _, err := parseCLI(context.Background(), []string{invalid, "--guest"}); err == nil {
+			t.Fatal("overlong DNS name or label bypassed validation")
+		}
+	}
+}
+
+func TestCLIFileDetectionDoesNotHideCIDRBehindNonDirectory(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if err := os.WriteFile("192.0.2.0", []byte("irrelevant existing file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := parseCLI(context.Background(), []string{"192.0.2.0/30", "--guest"})
+	if err != nil || len(cfg.targets) != 4 || cfg.targets[0] != (Target{"192.0.2.0", 445}) {
+		t.Fatalf("CIDR was rejected because its address names a local file: targets=%#v error=%v", cfg.targets, err)
+	}
+	// A regular file at the complete positional path still takes precedence.
+	if err := os.WriteFile("192.0.2.1", []byte("fileserver\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = parseCLI(context.Background(), []string{"192.0.2.1", "--guest"})
+	if err != nil || !reflect.DeepEqual(cfg.targets, []Target{{"fileserver", 445}}) {
+		t.Fatalf("existing host-list file lost precedence: targets=%#v error=%v", cfg.targets, err)
+	}
+}
+
+func TestCLIUnreadableHostFileDoesNotBecomeNetworkTarget(t *testing.T) {
+	t.Chdir(t.TempDir())
+	const candidate = "fileserver"
+	if err := os.WriteFile(candidate, []byte("another-server\n"), 0000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(candidate, 0600)
+	if file, err := os.Open(candidate); err == nil {
+		file.Close()
+		t.Skip("this environment permits reading a mode-000 file")
+	}
+	if _, err := parseCLI(context.Background(), []string{candidate, "--guest"}); err == nil {
+		t.Fatal("unreadable existing host-list file was treated as a network target")
+	}
+}
+
+func TestCLIAbsoluteHostnameReachesScanAndOutputUnchanged(t *testing.T) {
+	const hostname = "Fileserver.Example."
+	const endpoint = hostname + ":1445"
+	for _, jsonOutput := range []bool{false, true} {
+		var out, diagnostics bytes.Buffer
+		deps := testCLIDeps(&out, &diagnostics)
+		deps.scan = func(_ context.Context, target Target, _ Options) Result {
+			if target.Host != hostname || target.String() != endpoint {
+				t.Errorf("scan received a different DNS target: %q", target.String())
+			}
+			return Result{Target: target.String(), ServerIP: "192.0.2.1", Authentication: "guest", Enumeration: "ok"}
+		}
+		args := []string{endpoint, "--guest", "--no-header"}
+		if jsonOutput {
+			args = append(args, "--json")
+		}
+		if code := runCLI(context.Background(), args, deps); code != 0 {
+			t.Fatalf("absolute hostname scan failed: exit=%d diagnostics=%q", code, diagnostics.String())
+		}
+		if jsonOutput {
+			var results []Result
+			if err := json.Unmarshal(out.Bytes(), &results); err != nil || len(results) != 1 || results[0].Target != endpoint {
+				t.Fatalf("JSON lost the supplied absolute endpoint: %q (%v)", out.String(), err)
+			}
+		} else if rows := parseTestTSV(t, out.String()); len(rows) != 1 || rows[0][5] != hostname {
+			t.Fatalf("text lost the supplied absolute hostname: %q", out.String())
 		}
 	}
 }
@@ -123,7 +285,7 @@ func TestPositionalTargetFile(t *testing.T) {
 	}
 	want := []Target{{"server", 445}, {"other", 1445}, {"192.0.2.10", 445}, {"192.0.2.10", 2445}, {"2001:db8::1", 445}, {"2001:db8::1", 3445}}
 	for _, args := range [][]string{{path, "-u", "alice", "-p", "secret"}, {"-u", "alice", "-p", "secret", path}} {
-		cfg, err := parseCLI(args)
+		cfg, err := parseCLI(context.Background(), args)
 		if err != nil || !reflect.DeepEqual(cfg.targets, want) {
 			t.Fatalf("file parsing failed: %#v %v", cfg.targets, err)
 		}
@@ -133,7 +295,7 @@ func TestPositionalTargetFile(t *testing.T) {
 		{filepath.Dir(path), "-u", "alice"},
 		{path, "other", "-u", "alice"},
 	} {
-		if _, err := parseCLI(args); err == nil {
+		if _, err := parseCLI(context.Background(), args); err == nil {
 			t.Fatalf("accepted invalid file invocation: %#v", args)
 		}
 	}
@@ -146,7 +308,7 @@ func TestCLIRejectsRemovedOptions(t *testing.T) {
 		{"--file", "servers.txt", "--guest"},
 		{"--guest", "--file=servers.txt"},
 	} {
-		if _, err := parseCLI(args); err == nil || !strings.Contains(err.Error(), "unknown option") {
+		if _, err := parseCLI(context.Background(), args); err == nil || !strings.Contains(err.Error(), "unknown option") {
 			t.Fatalf("removed option was not rejected: args=%q err=%v", args, err)
 		}
 	}
@@ -163,7 +325,7 @@ func TestCLIInvalidArgumentsDoNotEchoSecrets(t *testing.T) {
 		{"--file", secret, "-u", "alice"},
 		{"host", "-u", "alice", "-p", secret, secret},
 	} {
-		_, err := parseCLI(args)
+		_, err := parseCLI(context.Background(), args)
 		if err == nil || strings.Contains(err.Error(), secret) {
 			t.Fatalf("diagnostic must fail without secret: %v", err)
 		}
@@ -365,7 +527,7 @@ func TestGuestFlagsBeforeAndAfterTarget(t *testing.T) {
 		{"--guest", "server", "--json"},
 		{"server:1445", "--guest", "--delay", "0"},
 	} {
-		cfg, err := parseCLI(args)
+		cfg, err := parseCLI(context.Background(), args)
 		if err != nil || !cfg.options.Guest || len(cfg.targets) != 1 || cfg.options.Username != "" || cfg.options.Password != "" || cfg.options.Domain != "" || cfg.passwordSet {
 			t.Fatalf("guest invocation failed: %#v %v", cfg, err)
 		}
@@ -375,7 +537,7 @@ func TestGuestFlagsBeforeAndAfterTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, args := range [][]string{{path, "--guest"}, {"--guest", path}} {
-		cfg, err := parseCLI(args)
+		cfg, err := parseCLI(context.Background(), args)
 		if err != nil || !cfg.options.Guest || len(cfg.targets) != 2 {
 			t.Fatalf("guest list invocation failed: %#v %v", cfg, err)
 		}
@@ -390,17 +552,17 @@ func TestGuestRejectsEveryExplicitCredentialOption(t *testing.T) {
 				{option, value, "host", "--guest"},
 				{"host", option + "=" + value, "--guest"},
 			} {
-				_, err := parseCLI(args)
+				_, err := parseCLI(context.Background(), args)
 				if err == nil || !strings.Contains(err.Error(), "cannot be combined") || strings.Contains(err.Error(), "credential-must-not-be-echoed") {
 					t.Fatalf("guest credentials were accepted or echoed: %v", err)
 				}
 			}
 		}
 	}
-	if _, err := parseCLI([]string{"host", "--guest=true"}); err == nil {
+	if _, err := parseCLI(context.Background(), []string{"host", "--guest=true"}); err == nil {
 		t.Fatal("--guest must be an explicit flag without a value")
 	}
-	if _, err := parseCLI([]string{"host"}); err == nil {
+	if _, err := parseCLI(context.Background(), []string{"host"}); err == nil {
 		t.Fatal("user mode must still require a username")
 	}
 }
@@ -482,7 +644,7 @@ func TestHelpExplainsColumnsAndAccessStatuses(t *testing.T) {
 	if code := runCLI(context.Background(), []string{"--help"}, deps); code != 0 {
 		t.Fatalf("help failed: %d", code)
 	}
-	for _, expected := range []string{"--guest", "Columns:", "SMB_SERVER_IP", "Supplied target IP", "SHARE", "Share name", "READ", "Root listing permission", "WRITE", "Permission to add files at root", "metadata only; no write test", "GUEST_FALLBACK", "TRUE when supplied credentials are accepted as Guest", "TRUE     Allowed", "FALSE    Denied", "UNKNOWN  Permission metadata missing/unsupported, or connection/login/access check failed", "TIMEOUT  Check timed out", "N/A      Not applicable"} {
+	for _, expected := range []string{"--guest", "Columns:", "TARGET_IP", "Supplied or connected IP plus port", "UNKNOWN:port if unavailable", "[IPv6]:port", "SHARE", "Share name", "READ", "Root listing permission", "WRITE", "Permission to add files at root", "metadata only; no write test", "GUEST", "TRUE when supplied credentials are accepted as Guest", "HOSTNAME", "Supplied hostname; - for literal IP targets (no reverse DNS)", "TRUE     Allowed", "FALSE    Denied", "UNKNOWN  Permission metadata missing/unsupported, or connection/login/access check failed", "TIMEOUT  Check timed out", "N/A      Not applicable"} {
 		if !strings.Contains(out.String(), expected) {
 			t.Errorf("help missing output explanation %q", expected)
 		}
@@ -514,9 +676,10 @@ func TestServerGuestFallbackReportsActualSessionWithoutRetry(t *testing.T) {
 	}
 }
 
-func TestCLITerminalAlignsFiveColumnsAcrossServers(t *testing.T) {
+func TestCLITerminalAlignsSixColumnsAcrossServers(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hosts")
-	if err := os.WriteFile(path, []byte("first\nsecond\n"), 0600); err != nil {
+	const longHost = "fileserver-with-a-hostname-longer-than-the-default-column.example.com"
+	if err := os.WriteFile(path, []byte("first\n[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535\n"+longHost+":1445\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	for _, noHeader := range []bool{false, true} {
@@ -527,17 +690,21 @@ func TestCLITerminalAlignsFiveColumnsAcrossServers(t *testing.T) {
 			if target.Host == "first" {
 				return Result{Target: target.String(), ServerIP: "192.0.2.1", Reachable: true, Authentication: "authenticated", Enumeration: "ok", Shares: []ShareResult{{Name: "a", Read: Allowed, Write: Unknown}}}
 			}
-			return Result{Target: target.String(), ServerIP: "2001:db8::1234", Reachable: true, Authentication: "guest", GuestFallback: true, Enumeration: "ok", Shares: []ShareResult{{Name: "a longer shared folder", Read: Denied, Write: NotApplicable}}}
+			if target.Host == longHost {
+				return Result{Target: target.String(), ServerIP: "192.0.2.2", Reachable: true, Authentication: "authenticated", Enumeration: "ok", Shares: []ShareResult{{Name: "long-host-share", Read: Allowed, Write: Denied}}}
+			}
+			return Result{Target: target.String(), ServerIP: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", Reachable: true, Authentication: "guest", GuestFallback: true, Enumeration: "ok", Shares: []ShareResult{{Name: "a longer shared folder", Read: Denied, Write: NotApplicable}}}
 		}
 		args := []string{path, "-u", "alice", "-p", "", "--delay", "0"}
 		wantRows := [][]string{
-			{"192.0.2.1", "a", "TRUE", "UNKNOWN", "FALSE"},
-			{"2001:db8::1234", "a longer shared folder", "FALSE", "N/A", "TRUE"},
+			{"192.0.2.1:445", "a", "TRUE", "UNKNOWN", "FALSE", "first"},
+			{"[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535", "a longer shared folder", "FALSE", "N/A", "TRUE", "-"},
+			{"192.0.2.2:1445", "long-host-share", "TRUE", "FALSE", "FALSE", longHost},
 		}
 		if noHeader {
 			args = append(args, "--no-header")
 		} else {
-			wantRows = append([][]string{{"SMB_SERVER_IP", "SHARE", "READ", "WRITE", "GUEST_FALLBACK"}}, wantRows...)
+			wantRows = append([][]string{{"TARGET_IP", "SHARE", "READ", "WRITE", "GUEST", "HOSTNAME"}}, wantRows...)
 		}
 		if code := runCLI(context.Background(), args, deps); code != 0 || errOut.Len() != 0 {
 			t.Fatalf("terminal output failed: code=%d stderr=%q", code, errOut.String())
@@ -549,13 +716,13 @@ func TestCLITerminalAlignsFiveColumnsAcrossServers(t *testing.T) {
 		if len(lines) != len(wantRows) {
 			t.Fatalf("terminal output has missing/extra rows: %q", out.String())
 		}
-		starts := make([]int, 5)
+		starts := make([]int, 6)
 		for i, row := range wantRows {
 			cursor := 0
 			for column, value := range row {
 				offset := strings.Index(lines[i][cursor:], value)
 				if offset < 0 || strings.Trim(lines[i][cursor:cursor+offset], " ") != "" || (column > 0 && offset == 0) {
-					t.Fatalf("terminal row does not preserve five separated cells: %q", lines[i])
+					t.Fatalf("terminal row does not preserve six separated cells: %q", lines[i])
 				}
 				start := cursor + offset
 				if i == 0 {
@@ -574,14 +741,15 @@ func TestCLITerminalAlignsFiveColumnsAcrossServers(t *testing.T) {
 
 func TestCLIProducesOneTSVHeaderAndSendsDiagnosticsToStderr(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hosts")
-	if err := os.WriteFile(path, []byte("first\nsecond\nthird\n"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("first:1445\nsecond\nthird\nmissing:3445\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	const header = "SMB_SERVER_IP\tSHARE\tREAD\tWRITE\tGUEST_FALLBACK\n"
-	const data = "192.0.2.1\tpublic data\tTRUE\tUNKNOWN\tFALSE\n" +
-		"192.0.2.1\tprivate\tFALSE\tFALSE\tFALSE\n" +
-		"192.0.2.2\t-\tUNKNOWN\tUNKNOWN\tFALSE\n" +
-		"192.0.2.3\t-\tUNKNOWN\tUNKNOWN\tFALSE\n"
+	const header = "TARGET_IP\tSHARE\tREAD\tWRITE\tGUEST\tHOSTNAME\n"
+	const data = "192.0.2.1:1445\tpublic data\tTRUE\tUNKNOWN\tFALSE\tfirst\n" +
+		"192.0.2.1:1445\tprivate\tFALSE\tFALSE\tFALSE\tfirst\n" +
+		"192.0.2.2:445\t-\tUNKNOWN\tUNKNOWN\tFALSE\tsecond\n" +
+		"192.0.2.3:445\t-\tUNKNOWN\tUNKNOWN\tFALSE\tthird\n" +
+		"UNKNOWN:3445\t-\tUNKNOWN\tUNKNOWN\tFALSE\tmissing\n"
 	for _, mode := range []string{"header", "no-header-before", "no-header-after", "forced-tsv-terminal", "forced-tsv-terminal-no-header"} {
 		t.Run(mode, func(t *testing.T) {
 			var out, errOut bytes.Buffer
@@ -595,6 +763,8 @@ func TestCLIProducesOneTSVHeaderAndSendsDiagnosticsToStderr(t *testing.T) {
 					}}
 				case "second":
 					return Result{Target: target.String(), ServerIP: "192.0.2.2", Reachable: true, Authentication: "failed", Enumeration: "not_attempted", Error: "login failed: do-not-leak-password"}
+				case "missing":
+					return Result{Target: target.String(), Authentication: "not_attempted", Enumeration: "not_attempted", Error: "name resolution failed"}
 				default:
 					return Result{Target: target.String(), ServerIP: "192.0.2.3", Reachable: true, Authentication: "authenticated", Enumeration: "ok"}
 				}
@@ -623,7 +793,7 @@ func TestCLIProducesOneTSVHeaderAndSendsDiagnosticsToStderr(t *testing.T) {
 				t.Fatalf("stdout has repeated headers, missing rows, or non-TSV content:\n%q\nwant:\n%q", out.String(), want)
 			}
 			parseTestTSV(t, out.String())
-			for _, message := range []string{"root listing denied", "login failed", "no shares returned"} {
+			for _, message := range []string{"root listing denied", "login failed", "no shares returned", "name resolution failed"} {
 				if strings.Count(strings.ToLower(errOut.String()), message) != 1 {
 					t.Errorf("diagnostic %q must appear once on stderr: %q", message, errOut.String())
 				}
@@ -664,6 +834,8 @@ func TestCLIStreamsTextBeforeNextHostAndKeepsProgressOffStdout(t *testing.T) {
 						}
 					} else if !strings.Contains(out.String(), "first-share") {
 						t.Fatalf("first host's rows were not emitted before starting the next host: %q", out.String())
+					} else if !strings.HasSuffix(out.String(), "first\n") {
+						t.Fatalf("streamed result did not retain the supplied hostname in the last column: %q", out.String())
 					}
 					if mode.progress && !strings.Contains(errOut.String(), "Progress: 50% (1/2 hosts completed)") {
 						t.Fatalf("live progress does not show the completed first host: %q", errOut.String())

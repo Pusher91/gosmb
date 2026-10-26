@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"testing"
 	"time"
 )
@@ -18,8 +19,12 @@ func assertTargetIPOutput(t *testing.T, result Result, want string) {
 		t.Fatal(err)
 	}
 	for _, row := range parseTestTSV(t, text.String()) {
-		if row[0] != want {
-			t.Fatalf("TSV server IP=%q, want %q", row[0], want)
+		_, port, err := net.SplitHostPort(result.Target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if endpoint := net.JoinHostPort(want, port); row[0] != endpoint || row[5] != "-" {
+			t.Fatalf("TSV endpoint=%q hostname=%q, want %q and no hostname", row[0], row[5], endpoint)
 		}
 	}
 	if err := writeJSONResults(&encoded, []Result{result}); err != nil {

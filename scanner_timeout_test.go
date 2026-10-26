@@ -7,11 +7,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
-
-	"github.com/jfjallid/go-smb/smb"
-	"github.com/jfjallid/golog"
 )
 
 func TestScanTargetHostDeadlineClosesNegotiationSocket(t *testing.T) {
@@ -48,9 +46,6 @@ func TestScanTargetHostDeadlineClosesNegotiationSocket(t *testing.T) {
 }
 
 func TestScanTargetTimeoutPreservesCompletedResults(t *testing.T) {
-	// The local SMB server shares the dependency's global logger. Silence it
-	// before starting its goroutines, including when this test runs alone.
-	silenceLogs.Do(func() { golog.SetAll(golog.LevelNone, 0, golog.NoOutput, golog.NoOutput) })
 	tests := []struct {
 		name      string
 		stall     string
@@ -69,6 +64,7 @@ func TestScanTargetTimeoutPreservesCompletedResults(t *testing.T) {
 		{"missing_metadata_stays_unknown_on_cleanup_timeout", "logoff", "absent", false, false, false, Allowed, Unknown, 1},
 		{"known_permissions_survive_cleanup_timeout", "logoff", "success", false, false, false, Allowed, Allowed, 1},
 		{"enumeration_timeout_retains_authentication", "rpc", "success", false, false, false, "", "", 0},
+		{"enumeration_io_timeout_retains_authentication", "rpc", "success", false, false, true, "", "", 0},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -82,24 +78,23 @@ func TestScanTargetTimeoutPreservesCompletedResults(t *testing.T) {
 				fixture.options.Username = "unknown-test-user"
 			}
 			proxy, stalled, done := newStallingSMBProxy(t, fixture.target, func(raw []byte) bool {
-				if len(raw) < 64 || string(raw[:4]) != smb.ProtocolSmb2 {
+				if len(raw) < 64 || string(raw[:4]) != "\xfeSMB" {
 					return false
 				}
 				command := binary.LittleEndian.Uint16(raw[12:14])
 				if tc.stall == "logoff" {
-					return command == smb.CommandLogoff
+					return command == 2
 				}
 				if tc.stall == "rpc" {
-					return command == smb.CommandIOCtl
+					return command == 9
 				}
-				if command != smb.CommandCreate {
+				if command != 5 {
 					return false
 				}
-				var req smb.CreateReq
-				if err := req.UnmarshalBinary(raw); err != nil {
+				if len(raw) < 120 {
 					return false
 				}
-				return req.NameLength == 0 && (tc.stall == "root" || req.DesiredAccess == smb.FAccMaskFileReadAttributes)
+				return binary.LittleEndian.Uint16(raw[110:112]) == 0 && (tc.stall == "root" || binary.LittleEndian.Uint32(raw[88:92]) == 0x80)
 			})
 			started := time.Now()
 			result := scanTarget(context.Background(), proxy, fixture.options)
@@ -143,6 +138,97 @@ func TestScanTargetTimeoutPreservesCompletedResults(t *testing.T) {
 			}
 			fixture.assertUnchanged(t, tc.wantOpens)
 		})
+	}
+}
+
+func TestEnumerationCleanupTimeoutPreservesCompletedShareList(t *testing.T) {
+	for _, command := range []uint16{6, 4} {
+		name := "pipe close"
+		if command == 4 {
+			name = "IPC$ disconnect"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := newEnumerationFixture(t, 0x001f01ff, 0x001f01ff, "success", false)
+			fixture.options.HostTimeout = 300 * time.Millisecond
+			target, stalled, done := newStallingSMBProxy(t, fixture.target, func(packet []byte) bool {
+				return len(packet) >= 64 && binary.LittleEndian.Uint16(packet[12:]) == command && binary.LittleEndian.Uint32(packet[36:]) == 1
+			})
+			result := scanTarget(context.Background(), target, fixture.options)
+			if !result.TimedOut || result.Authentication != "authenticated" || result.Enumeration != "ok" || !result.enumerationComplete || len(result.Shares) != 3 {
+				t.Fatalf("cleanup timeout erased completed enumeration: %+v", result)
+			}
+			if !strings.Contains(result.Error, "enumeration") {
+				t.Fatalf("cleanup timeout lost its phase: %q", result.Error)
+			}
+			for _, share := range result.Shares {
+				want := NotApplicable
+				if share.Name == "data$" {
+					want = TimedOut
+				}
+				if share.Read != want || share.Write != want {
+					t.Errorf("cleanup timeout misclassified unprobed share: %+v", share)
+				}
+			}
+			select {
+			case <-stalled:
+			default:
+				t.Fatal("scan did not reach enumeration cleanup")
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("cleanup timeout left a connection open")
+			}
+			fixture.assertUnchanged(t, 0)
+		})
+	}
+}
+
+func TestEnumerationFailureSurvivesCleanupTimeout(t *testing.T) {
+	for _, failure := range []struct {
+		name, outcome, diagnostic string
+		status                    uint32
+		malformed                 bool
+	}{
+		{"server status", "error", "Windows status 124", 124, false},
+		{"malformed NDR", "error", "invalid share information level", 0, true},
+		{"access denied", "denied", "share enumeration denied", 5, false},
+	} {
+		for _, command := range []uint16{6, 4} {
+			name := "pipe close"
+			if command == 4 {
+				name = "IPC$ disconnect"
+			}
+			t.Run(failure.name+"/"+name, func(t *testing.T) {
+				fixture := newEnumerationFixture(t, 0x001f01ff, 0x001f01ff, "success", false)
+				fixture.options.HostTimeout = 300 * time.Millisecond
+				fixture.guard.mu.Lock()
+				fixture.guard.enumerationStatus = failure.status
+				fixture.guard.malformedEnumeration = failure.malformed
+				fixture.guard.mu.Unlock()
+				target, stalled, done := newStallingSMBProxy(t, fixture.target, func(packet []byte) bool {
+					return len(packet) >= 64 && binary.LittleEndian.Uint16(packet[12:]) == command && binary.LittleEndian.Uint32(packet[36:]) == 1
+				})
+				result := scanTarget(context.Background(), target, fixture.options)
+				if !result.TimedOut || result.Authentication != "authenticated" || result.Enumeration != failure.outcome || !result.enumerationComplete || len(result.Shares) != 0 {
+					t.Errorf("cleanup timeout replaced an observed enumeration failure: %+v", result)
+				}
+				if !strings.Contains(result.Error, failure.diagnostic) {
+					t.Errorf("primary enumeration failure was lost: %q", result.Error)
+				}
+				select {
+				case <-stalled:
+				default:
+					t.Fatal("scan did not reach enumeration cleanup")
+				}
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("cleanup timeout left a connection open")
+				}
+				fixture.assertUnchanged(t, 0)
+			})
+		}
 	}
 }
 

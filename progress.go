@@ -43,10 +43,7 @@ func (p *progressDisplay) label(completed int) string {
 }
 
 func (p *progressDisplay) write(text string, visible bool) error {
-	n, err := io.WriteString(p.out, text)
-	if err == nil && n != len(text) {
-		err = io.ErrShortWrite
-	}
+	n, err := writeOutputString(p.out, text)
 	if err == nil {
 		p.visible = visible
 	} else if n > 0 {

@@ -16,29 +16,16 @@ import (
 	"unicode/utf8"
 )
 
-const quickUsage = `gosmb - Read-only SMB share permission checker
-
-Usage:
-  gosmb <server|servers.txt> -u USER [-p PASSWORD] [options]
-  gosmb <server|servers.txt> --guest [options]
-
-Each target: host[:port] or [IPv6]:port (default: 445).
-
-Examples:
-  gosmb 192.0.2.10:1445 -u alice -p 'password'
-  gosmb servers.txt -u 'DOMAIN\alice'
-  gosmb 192.0.2.10 --guest
-
-Omit -p for a hidden password prompt.
-`
-
 const usage = `gosmb - Read-only SMB share permission checker
 
 Usage:
-  gosmb <server|servers.txt> -u USER [-p PASSWORD] [options]
-  gosmb <server|servers.txt> --guest [options]
+  gosmb <server|CIDR|servers.txt> -u USER [-p PASSWORD] [options]
+  gosmb <server|CIDR|servers.txt> --guest [options]
 
 Each target: host[:port] or [IPv6]:port (default: 445).
+CIDRs: IPv4/prefix[:port] or IPv6/prefix; [IPv6/prefix]:port for a custom port.
+Ranges include every address; overlapping endpoints are scanned once.
+Maximum: 65,536 unique endpoints per run; larger individual ranges are rejected.
 
 Options (before or after the target):
   -u, --user USER       Account; DOMAIN\user or user@domain
@@ -56,11 +43,13 @@ Options (before or after the target):
   -h, --help            Show help
 
 Columns:
-  SMB_SERVER_IP   Supplied target IP; connected IP for hostname targets
-  SHARE           Share name
-  READ            Root listing permission
-  WRITE           Permission to add files at root (metadata only; no write test)
-  GUEST_FALLBACK  TRUE when supplied credentials are accepted as Guest
+  TARGET_IP  Supplied or connected IP plus port; UNKNOWN:port if unavailable
+             IPv6 endpoints use [IPv6]:port
+  SHARE      Share name
+  READ       Root listing permission
+  WRITE      Permission to add files at root (metadata only; no write test)
+  GUEST      TRUE when supplied credentials are accepted as Guest
+  HOSTNAME   Supplied hostname; - for literal IP targets (no reverse DNS)
 
 READ/WRITE statuses (text output):
   TRUE     Allowed
@@ -94,11 +83,47 @@ type cliDependencies struct {
 	scan             func(context.Context, Target, Options) Result
 }
 
+func cliOptionTakesValue(name string) bool {
+	switch name {
+	case "-u", "--user", "--username", "-p", "--pass", "--password", "-d", "--domain", "--timeout", "--host-timeout", "--concurrency", "--delay":
+		return true
+	}
+	return false
+}
+
+// Help takes precedence over validation, but an option value such as a password
+// containing "--help", or an argument after "--", is not a help request.
+func helpRequested(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if arg == "-h" || arg == "--help" {
+			return true
+		}
+		name, _, hasValue := strings.Cut(arg, "=")
+		if cliOptionTakesValue(name) && !hasValue {
+			i++
+		}
+	}
+	return false
+}
+
 // parseCLI deliberately excludes argument values from diagnostics: a misplaced
 // credential must not be repeated in an error message.
-func parseCLI(args []string) (cliConfig, error) {
+func parseCLI(ctx context.Context, args []string) (cliConfig, error) {
 	cfg := cliConfig{options: Options{Timeout: 10 * time.Second, HostTimeout: 30 * time.Second},
-		delay: 250 * time.Millisecond, concurrency: 1, help: len(args) == 0}
+		delay: 250 * time.Millisecond, concurrency: 1, help: helpRequested(args)}
+	if cfg.help {
+		return cfg, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return cfg, err
+	}
 	var positionals []string
 	credentialsSet := false
 	flagsDone := false
@@ -115,11 +140,8 @@ func parseCLI(args []string) (cliConfig, error) {
 		name, value, hasValue := strings.Cut(arg, "=")
 		switch name {
 		case "-h", "--help":
-			if hasValue {
-				return cfg, errors.New("help does not accept a value")
-			}
-			cfg.help = true
-			continue
+			// Bare help flags returned above; only valued forms reach this case.
+			return cfg, errors.New("help does not accept a value")
 		case "--json":
 			if hasValue {
 				return cfg, errors.New("json does not accept a value")
@@ -150,9 +172,10 @@ func parseCLI(args []string) (cliConfig, error) {
 			}
 			cfg.options.Guest = true
 			continue
-		case "-u", "--user", "--username", "-p", "--pass", "--password", "-d", "--domain", "--timeout", "--host-timeout", "--concurrency", "--delay":
 		default:
-			return cfg, errors.New("unknown option; use --help for supported options")
+			if !cliOptionTakesValue(name) {
+				return cfg, errors.New("unknown option; use --help for supported options")
+			}
 		}
 		if !hasValue {
 			if i+1 >= len(args) {
@@ -200,9 +223,6 @@ func parseCLI(args []string) (cliConfig, error) {
 	if cfg.options.Guest && credentialsSet {
 		return cfg, errors.New("--guest cannot be combined with username, password, or domain options")
 	}
-	if cfg.help {
-		return cfg, nil
-	}
 	if cfg.json && cfg.tsv {
 		return cfg, errors.New("choose either --json or --tsv")
 	}
@@ -214,7 +234,10 @@ func parseCLI(args []string) (cliConfig, error) {
 		}
 	}
 	if len(positionals) != 1 {
-		return cfg, errors.New("provide exactly one host or host-list file")
+		return cfg, errors.New("provide exactly one host, CIDR range, or host-list file")
+	}
+	if err := ctx.Err(); err != nil {
+		return cfg, err
 	}
 	candidate := positionals[0]
 	if strings.HasPrefix(candidate, `\\`) || strings.HasPrefix(candidate, "//") || strings.Contains(candidate, "://") {
@@ -224,15 +247,19 @@ func parseCLI(args []string) (cliConfig, error) {
 		if !info.Mode().IsRegular() {
 			return cfg, errors.New("host-list path must be a regular file")
 		}
-		cfg.targets, err = readTargets(candidate)
-	} else if !errors.Is(statErr, os.ErrNotExist) {
+		cfg.targets, err = readTargets(ctx, candidate)
+	} else if !errors.Is(statErr, os.ErrNotExist) && !invalidListFilePath(statErr) {
 		return cfg, errors.New("cannot inspect host-list path")
 	} else {
-		var target Target
-		target, err = parseTarget(candidate)
-		if err == nil {
-			cfg.targets = []Target{target}
+		// A valid network endpoint need not be a valid local filename (for
+		// example, a maximum-length hostname with a port, or Windows IPv6).
+		if err := ctx.Err(); err != nil {
+			return cfg, err
 		}
+		cfg.targets, err = parseTargetSpec(candidate)
+	}
+	if err == nil {
+		err = ctx.Err()
 	}
 	return cfg, err
 }
@@ -240,6 +267,9 @@ func parseCLI(args []string) (cliConfig, error) {
 func parseIdentity(user, domain string) (string, string, error) {
 	if user == "" {
 		return "", "", errors.New("username required: use -u USER or --guest")
+	}
+	if !utf8.ValidString(user) || !utf8.ValidString(domain) {
+		return "", "", errors.New("username and domain must be valid UTF-8")
 	}
 	if strings.TrimSpace(user) != user || strings.TrimSpace(domain) != domain {
 		return "", "", errors.New("username and domain must not have surrounding whitespace")
@@ -335,14 +365,16 @@ func parseTarget(raw string) (Target, error) {
 		}
 		host = addr.String()
 	} else {
-		host = strings.TrimSuffix(host, ".")
-		if len(host) == 0 || len(host) > 253 || strings.Contains(host, ":") {
+		// A final dot is the DNS root label: retain it in the target so an
+		// absolute name cannot become subject to resolver search suffixes.
+		labels := strings.TrimSuffix(host, ".")
+		if len(labels) == 0 || len(labels) > 253 || strings.Contains(labels, ":") {
 			return Target{}, bad
 		}
-		if strings.Contains(host, ".") && strings.IndexFunc(host, func(r rune) bool { return r != '.' && (r < '0' || r > '9') }) == -1 {
+		if strings.Contains(labels, ".") && strings.IndexFunc(labels, func(r rune) bool { return r != '.' && (r < '0' || r > '9') }) == -1 {
 			return Target{}, bad
 		}
-		for _, label := range strings.Split(host, ".") {
+		for _, label := range strings.Split(labels, ".") {
 			if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
 				return Target{}, bad
 			}
@@ -356,7 +388,10 @@ func parseTarget(raw string) (Target, error) {
 	return Target{Host: host, Port: port}, nil
 }
 
-func readTargets(path string) ([]Target, error) {
+func readTargets(ctx context.Context, path string) ([]Target, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, "//") || strings.Contains(path, "://") {
 		return nil, errors.New("host-list file must be a local path, not a URL or UNC path")
 	}
@@ -373,15 +408,24 @@ func readTargets(path string) ([]Target, error) {
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, errors.New("host-list path must be a readable regular file")
 	}
-	return parseTargetList(f)
+	return parseTargetList(ctx, f)
 }
 
-func parseTargetList(r io.Reader) ([]Target, error) {
+func parseTargetList(ctx context.Context, r io.Reader) ([]Target, error) {
 	var targets []Target
-	seen := make(map[string]bool)
+	var seen map[Target]struct{}
 	scanner := bufio.NewScanner(r)
 	lineNumber := 0
-	for scanner.Scan() {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !scanner.Scan() {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		lineNumber++
 		line := scanner.Text()
 		if lineNumber == 1 {
@@ -394,15 +438,23 @@ func parseTargetList(r io.Reader) ([]Target, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		target, err := parseTarget(line)
+		expanded, err := parseTargetSpec(line)
 		if err != nil {
-			return nil, fmt.Errorf("invalid target at host-list line %d", lineNumber)
+			return nil, fmt.Errorf("invalid target at host-list line %d: %w", lineNumber, err)
 		}
-		key := strings.ToLower(target.String())
-		if !seen[key] {
-			seen[key] = true
-			targets = append(targets, target)
+		if seen == nil {
+			// The first bounded expansion gives an exact initial capacity;
+			// a large CIDR need not repeatedly grow both collections.
+			seen = make(map[Target]struct{}, len(expanded))
+			targets = make([]Target, 0, len(expanded))
 		}
+		targets, err = appendUniqueTargets(targets, seen, expanded)
+		if err != nil {
+			return nil, fmt.Errorf("host-list line %d: %w", lineNumber, err)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if scanner.Err() != nil {
 		return nil, errors.New("cannot read host-list file (read error or line too long)")
@@ -414,17 +466,17 @@ func parseTargetList(r io.Reader) ([]Target, error) {
 }
 
 func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int) {
-	cfg, err := parseCLI(args)
+	cfg, err := parseCLI(ctx, args)
 	if err != nil {
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			fmt.Fprintln(deps.stderr, "gosmb: canceled")
+			return 1
+		}
 		fmt.Fprintf(deps.stderr, "gosmb: %s\n", err)
 		return 2
 	}
 	if cfg.help {
-		helpText := usage
-		if len(args) == 0 {
-			helpText = quickUsage + "Run 'gosmb --help' for all options.\n"
-		}
-		if _, err := io.WriteString(deps.stdout, helpText); err != nil {
+		if _, err := writeOutputString(deps.stdout, usage); err != nil {
 			fmt.Fprintln(deps.stderr, "gosmb: could not write output")
 			return 1
 		}
@@ -450,7 +502,10 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 			return 2
 		}
 	}
-	results := make([]Result, 0, len(cfg.targets))
+	var results []Result
+	if cfg.json {
+		results = make([]Result, 0, len(cfg.targets))
+	}
 	aligned := deps.stdoutIsTerminal && !cfg.tsv && !cfg.json
 	if !cfg.json && !cfg.noHeader {
 		writeHeader := writeTextHeader

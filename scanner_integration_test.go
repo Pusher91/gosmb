@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/md5"
+	"crypto/rc4"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -14,15 +20,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf16"
 
-	"github.com/jfjallid/go-smb/dcerpc/mssrvs"
-	srvsvc "github.com/jfjallid/go-smb/dcerpc/mssrvs/server"
-	dcserver "github.com/jfjallid/go-smb/dcerpc/server"
-	"github.com/jfjallid/go-smb/ntlmssp"
-	"github.com/jfjallid/go-smb/smb"
-	"github.com/jfjallid/go-smb/smb/server"
-	"github.com/jfjallid/go-smb/smb/server/filevfs"
-	smbunicode "github.com/jfjallid/go-smb/smb/unicode"
+	"golang.org/x/crypto/md4"
 )
 
 // These tests use only a loopback listener, synthetic credentials, and a
@@ -96,6 +96,67 @@ func TestScanTargetAuthenticationFailureDoesNotProbeShares(t *testing.T) {
 	fixture.assertUnchanged(t, 0)
 }
 
+func TestScanTargetAuthenticationRejectionStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status uint32
+		auth   string
+	}{
+		{"expired_account", 0xc0000193, "failed"},
+		{"restricted_logon_hours", 0xc000006f, "failed"},
+		{"restricted_workstation", 0xc0000070, "failed"},
+		{"unsupported_server_operation", 0xc00000bb, "error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newEnumerationFixture(t, 0x001f01ff, 0x001f01ff, "success", false)
+			fixture.guard.mu.Lock()
+			fixture.guard.authenticationStatus = tc.status
+			fixture.guard.mu.Unlock()
+			result := scanTarget(context.Background(), fixture.target, fixture.options)
+			if !result.Reachable || result.Authentication != tc.auth || !result.authenticationComplete || result.TimedOut {
+				t.Errorf("authentication rejection = %+v; want completed %s", result, tc.auth)
+			}
+			if result.Enumeration != "not_attempted" || len(result.Shares) != 0 {
+				t.Errorf("authentication rejection probed shares: %+v", result)
+			}
+			if !strings.Contains(result.Error, fmt.Sprintf("0x%08x", tc.status)) {
+				t.Errorf("authentication rejection lost server status: %+v", result)
+			}
+			fixture.assertUnchanged(t, 0)
+		})
+	}
+}
+
+func TestScanTargetReportsEnumerationCleanupDenial(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command uint16
+	}{
+		{"pipe close", 6},
+		{"IPC$ disconnect", 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newEnumerationFixture(t, 0x001f01ff, 0x001f01ff, "success", false)
+			fixture.guard.mu.Lock()
+			fixture.guard.deniedIPCCleanup = tc.command
+			fixture.guard.mu.Unlock()
+			result := scanTarget(context.Background(), fixture.target, fixture.options)
+			if result.Enumeration != "ok" || !result.enumerationComplete || len(result.Shares) != 3 || result.TimedOut {
+				t.Fatalf("cleanup denial changed completed enumeration: %+v", result)
+			}
+			if !strings.Contains(result.Error, "enumeration") || !strings.Contains(result.Error, "0xc0000022") {
+				t.Fatalf("cleanup denial was discarded: %+v", result)
+			}
+			for _, share := range result.Shares {
+				if share.Name == "data$" && (share.Read != Allowed || share.Write != Allowed) {
+					t.Errorf("normal cleanup status prevented remaining share checks: %+v", share)
+				}
+			}
+			fixture.assertUnchanged(t, 1)
+		})
+	}
+}
+
 func TestScanTargetGuestIdentity(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -110,8 +171,12 @@ func TestScanTargetGuestIdentity(t *testing.T) {
 		{"invalid_credentials_mapped_to_guest", "map_guest", false, true, "guest", true, true},
 		{"explicit_guest_ignores_supplied_credentials", "map_guest", true, false, "guest", false, true},
 		{"explicit_guest_not_accepted_as_user", "guest_as_user", true, false, "authenticated", false, false},
-		{"credential_login_mapped_to_anonymous", "force_anonymous", false, false, "unverified", false, false},
-		{"explicit_guest_mapped_to_anonymous", "force_anonymous", true, false, "unverified", false, false},
+		{"credential_login_mapped_to_anonymous", "force_anonymous", false, false, "anonymous", false, false},
+		{"explicit_guest_mapped_to_anonymous", "force_anonymous", true, false, "anonymous", false, false},
+		{"mixed_guest_and_null_rejected", "mixed_guest_null", false, false, "error", false, false},
+		{"mixed_guest_and_encryption_rejected", "mixed_guest_encryption", false, false, "error", false, false},
+		{"unknown_session_flag_rejected", "unknown_session_flag", false, false, "error", false, false},
+		{"encryption_flag_on_smb21_rejected", "smb21_encryption_flag", false, false, "error", false, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -221,6 +286,9 @@ func snapshotFixture(t *testing.T, root string) map[string]fixtureFile {
 	return snapshot
 }
 
+// The fixture owns its wire encoders and authentication verifier. It intentionally
+// does not import the client implementation: a shared codec could make the same
+// mistake at both ends and conceal a protocol regression.
 func newEnumerationFixture(t *testing.T, shareMask, objectMask uint32, contextMode string, denyList bool, authModes ...string) *enumerationFixture {
 	t.Helper()
 	authMode := ""
@@ -231,220 +299,58 @@ func newEnumerationFixture(t *testing.T, shareMask, objectMask uint32, contextMo
 	if err := os.WriteFile(filepath.Join(root, "keep.txt"), []byte("existing contents must remain unchanged\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	vfs, err := filevfs.New(filevfs.Options{Root: root})
-	if err != nil {
-		t.Fatal(err)
-	}
-	guard := &guardedEnumerationVFS{VFS: vfs, denyList: denyList}
+	guard := &guardedEnumerationVFS{denyList: denyList}
 	if contextMode == "unsupported" {
-		guard.rejectFirstOpen = smb.StatusNotSupported
-	} else if contextMode == "invalid_parameter" {
-		guard.rejectFirstOpen = smb.StatusInvalidParameter
+		guard.rejectFirstOpen = 0xc00000bb
 	}
-	fixture := &enumerationFixture{
-		root: root, before: snapshotFixture(t, root), guard: guard,
-		options: Options{Username: "audit-user", Password: "synthetic-fixture-password", Domain: "LAB", Timeout: 2 * time.Second},
+	if contextMode == "invalid_parameter" {
+		guard.rejectFirstOpen = 0xc000000d
 	}
-	var treesMu sync.Mutex
-	diskTrees := make(map[uint32]bool)
-	guestTrees := make(map[uint32]bool)
-	isDiskTree := func(id uint32) bool {
-		treesMu.Lock()
-		defer treesMu.Unlock()
-		return diskTrees[id]
-	}
-	isGuestTree := func(id uint32) bool {
-		treesMu.Lock()
-		defer treesMu.Unlock()
-		return guestTrees[id]
-	}
-	srv := &server.Server{Config: &server.ServerConfig{
-		// Signing remains enabled and required. Encryption is not advertised
-		// so the request hook can inspect actual operations in this fixture.
-		SigningRequired: true,
-		Authenticator: &server.MapAuthenticator{
-			Domain: fixture.options.Domain,
-			Accounts: map[string]*server.Account{
-				fixture.options.Username: {NTHash: ntlmssp.Ntowfv1(fixture.options.Password)},
-			},
-		},
-		OnConnect: func(_ *server.Conn) error {
-			guard.mu.Lock()
-			guard.connections++
-			guard.mu.Unlock()
-			return nil
-		},
-		OnSessionSetup: func(conn *server.Conn, session *server.Session, _ []byte, stage server.SessionSetupStage) (*server.Status, error) {
-			if stage != server.SessionSetupStageAuthenticate {
-				return nil, nil
-			}
-			guard.mu.Lock()
-			guard.authAttempts++
-			guard.mu.Unlock()
-			original := session.AuthAcceptor.Verify
-			session.AuthAcceptor.Verify = func(auth *ntlmssp.Authenticate, challenge [8]byte) ([]byte, uint32) {
-				user, userErr := smbunicode.FromUnicodeString(auth.UserName)
-				domain, domainErr := smbunicode.FromUnicodeString(auth.DomainName)
-				if userErr != nil || domainErr != nil {
-					guard.record("invalid authentication identity encoding")
-				}
-				emptyVerifier := &server.MapAuthenticator{Accounts: map[string]*server.Account{"": {NTHash: ntlmssp.Ntowfv1("")}}}
-				emptyKey, emptyStatus := emptyVerifier.Verify(conn, auth, challenge)
-				guard.mu.Lock()
-				guard.wireUsers = append(guard.wireUsers, user)
-				guard.wireDomains = append(guard.wireDomains, domain)
-				guard.guestEmptyPasswordVerified = user == "" && emptyStatus == smb.StatusOk
-				guard.mu.Unlock()
-				if authMode == "force_anonymous" {
-					session.Flags |= smb.SessionFlagIsNull
-					return nil, smb.StatusOk
-				}
-				if authMode == "guest_as_user" {
-					return emptyKey, emptyStatus // Normal authenticated session, without Guest flag.
-				}
-				key, status := original(auth, challenge)
-				if status != smb.StatusOk && authMode == "map_guest" {
-					// Set the flag before the acceptor constructs its final token,
-					// so both SMB and SPNEGO report acceptance, without a session key.
-					session.Flags |= smb.SessionFlagIsGuest
-					return nil, smb.StatusOk
-				}
-				return key, status
-			}
-			return nil, nil
-		},
-		OnTreeConnect: func(_ *server.Conn, session *server.Session, name string, _ *smb.TreeConnectReq, response *smb.TreeConnectRes) (*server.Status, error) {
-			if strings.EqualFold(name, "data$") {
-				treesMu.Lock()
-				diskTrees[response.Header.TreeID] = true
-				guestTrees[response.Header.TreeID] = session.Flags&smb.SessionFlagIsGuest != 0
-				treesMu.Unlock()
-				if session.Flags&smb.SessionFlagIsGuest != 0 {
-					response.MaximalAccess = 0x00120089
-					if len(session.SessionKey) != 0 {
-						guard.record("fixture Guest unexpectedly has a session key")
-					}
-				}
-			}
-			if strings.EqualFold(name, "printer") {
-				guard.record("unexpected printer tree connect")
-			}
-			return nil, nil
-		},
-		OnRawRequest: func(_ *server.Conn, raw []byte) (bool, error) {
-			if len(raw) < 64 || string(raw[:4]) != smb.ProtocolSmb2 {
-				return false, nil
-			}
-			var header smb.Header
-			if err := header.UnmarshalBinary(raw); err != nil {
-				return false, err
-			}
-			if !isDiskTree(header.TreeID) {
-				return false, nil // IPC$ requests are SRVSVC RPC, not disk writes.
-			}
-			switch header.Command {
-			case smb.CommandCreate:
-				var req smb.CreateReq
-				if err := req.UnmarshalBinary(raw); err != nil {
-					return false, err
-				}
-				if req.RequestedOplockLevel != smb.OpLockLevelNone || req.ShareAccess != smb.FileShareRead|smb.FileShareWrite|smb.FileShareDelete {
-					guard.record(fmt.Sprintf("open may lock other clients: oplock=%d share-access=%#x", req.RequestedOplockLevel, req.ShareAccess))
-				}
-				contexts, err := req.CreateReqContexts()
-				if err != nil {
-					return false, err
-				}
-				guard.mu.Lock()
-				fallback := guard.rejectFirstOpen != 0 && guard.opens == 1
-				guard.mu.Unlock()
-				if fallback {
-					if len(contexts) != 0 {
-						guard.record("unsupported-metadata fallback still included create contexts")
-					}
-				} else if len(contexts) < 20 || string(contexts[16:20]) != "MxAc" || binary.LittleEndian.Uint32(contexts[12:16]) != 0 {
-					guard.record("root open did not request fresh MxAc metadata")
-				}
-			case smb.CommandClose, smb.CommandTreeDisconnect:
-			default:
-				guard.record(fmt.Sprintf("unexpected disk SMB command %#x", header.Command))
-				return false, fmt.Errorf("fixture refuses disk operation %#x", header.Command)
-			}
-			return false, nil
-		},
-		OnRawResponse: func(_ *server.Conn, raw []byte) ([]byte, error) {
-			if len(raw) < 64 || string(raw[:4]) != smb.ProtocolSmb2 {
-				return raw, nil
-			}
-			var header smb.Header
-			if err := header.UnmarshalBinary(raw); err != nil {
-				return nil, err
-			}
-			if header.Command != smb.CommandCreate || header.Status != smb.StatusOk || !isDiskTree(header.TreeID) {
-				return raw, nil
-			}
-			var response smb.CreateRes
-			if err := response.UnmarshalBinary(raw); err != nil {
-				return nil, err
-			}
-			response.Buffer = nil
-			if contextMode != "absent" && contextMode != "unsupported" && contextMode != "invalid_parameter" {
-				// Independent fixture wire encoding: 16-byte context header,
-				// four-byte name, padding, QueryStatus, and MaximalAccess.
-				cc := make([]byte, 32)
-				binary.LittleEndian.PutUint16(cc[4:6], 16)
-				binary.LittleEndian.PutUint16(cc[6:8], 4)
-				binary.LittleEndian.PutUint16(cc[10:12], 24)
-				binary.LittleEndian.PutUint32(cc[12:16], 8)
-				copy(cc[16:20], "MxAc")
-				mask := objectMask
-				if isGuestTree(header.TreeID) {
-					mask = 0x00120089
-				}
-				binary.LittleEndian.PutUint32(cc[28:32], mask)
-				if contextMode == "failed" {
-					binary.LittleEndian.PutUint32(cc[24:28], smb.StatusAccessDenied)
-				}
-				if contextMode == "malformed" {
-					cc = cc[:28] // Advertised data extends past the context.
-				}
-				response.Buffer = cc
-			}
-			return response.MarshalBinary()
-		},
-	}}
-	srv.RegisterShare("data$", server.Share{Type: smb.ShareTypeDisk, VFS: guard, MaximalAccess: shareMask})
-	svc := &srvsvc.Service{ServerName: "LOOPBACK-TEST", Shares: []srvsvc.ShareEntry{
-		{Name: "data$", Type: mssrvs.StypeDisktree | mssrvs.StypeSpecial, Comment: "fixture disk"},
-		{Name: "IPC$", Type: mssrvs.StypeIPC | mssrvs.StypeSpecial, Comment: "fixture RPC"},
-		{Name: "printer", Type: mssrvs.StypePrintq, Comment: "must not be probed"},
-	}}
-	srv.Config.PipeOpener = &server.MapPipeOpener{Pipes: map[string]func(*server.Session) (server.PipeBackend, error){
-		"srvsvc": func(_ *server.Session) (server.PipeBackend, error) {
-			return dcserver.NewPipeHandler("srvsvc", svc), nil
-		},
-	}}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	fixture := &enumerationFixture{root: root, before: snapshotFixture(t, root), guard: guard,
+		options: Options{Username: "audit-user", Password: "synthetic-fixture-password", Domain: "LAB", Timeout: 2 * time.Second}}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	fixture.target = Target{Host: "127.0.0.1", Port: listener.Addr().(*net.TCPAddr).Port}
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- srv.Serve(listener) }()
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
-			t.Errorf("fixture shutdown: %v", err)
-		}
-		select {
-		case err := <-serveDone:
-			if err != nil && err != server.ErrServerClosed {
-				t.Errorf("fixture serve: %v", err)
+	var mu sync.Mutex
+	connections := make(map[net.Conn]bool)
+	var workers sync.WaitGroup
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
 			}
-		case <-ctx.Done():
-			t.Error("fixture server did not stop")
+			mu.Lock()
+			connections[conn] = true
+			mu.Unlock()
+			guard.mu.Lock()
+			guard.connections++
+			guard.mu.Unlock()
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				defer conn.Close()
+				defer func() { mu.Lock(); delete(connections, conn); mu.Unlock() }()
+				server := &fixtureSMBServer{fixture: fixture, conn: conn, shareMask: shareMask, objectMask: objectMask,
+					contextMode: contextMode, authMode: authMode, handles: make(map[uint64]*os.File), nextHandle: 2}
+				defer server.closeHandles()
+				server.serve()
+			}()
 		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		<-done
+		mu.Lock()
+		for conn := range connections {
+			_ = conn.Close()
+		}
+		mu.Unlock()
+		workers.Wait()
 	})
 	return fixture
 }
@@ -471,20 +377,16 @@ func (f *enumerationFixture) assertUnchanged(t *testing.T, wantOpens int) {
 }
 
 type guardedEnumerationVFS struct {
-	server.VFS
-	mu                         sync.Mutex
-	denyList                   bool
-	rejectFirstOpen            uint32
-	opens                      int
-	successful                 int
-	closed                     int
-	unexpected                 []string
-	connections                int
-	authAttempts               int
-	wireUsers                  []string
-	wireDomains                []string
-	guestEmptyPasswordVerified bool
-	guestOpens                 int
+	mu                                                               sync.Mutex
+	denyList                                                         bool
+	authenticationStatus                                             uint32
+	enumerationStatus                                                uint32
+	malformedEnumeration                                             bool
+	rejectFirstOpen                                                  uint32
+	deniedIPCCleanup                                                 uint16
+	opens, successful, closed, connections, authAttempts, guestOpens int
+	unexpected, wireUsers, wireDomains                               []string
+	guestEmptyPasswordVerified                                       bool
 }
 
 func (v *guardedEnumerationVFS) record(message string) {
@@ -493,62 +395,704 @@ func (v *guardedEnumerationVFS) record(message string) {
 	v.unexpected = append(v.unexpected, message)
 }
 
-func (v *guardedEnumerationVFS) Create(ctx context.Context, session *server.Session, req server.CreateRequest) (server.CreateResult, uint32, error) {
-	v.mu.Lock()
-	v.opens++
-	attempt := v.opens
-	if session.Flags&smb.SessionFlagIsGuest != 0 {
-		v.guestOpens++
+type fixtureSMBServer struct {
+	fixture                                     *enumerationFixture
+	conn                                        net.Conn
+	shareMask, objectMask                       uint32
+	contextMode, authMode                       string
+	sessionKey, negotiate, challenge, pipeReply []byte
+	sessionFlags                                uint16
+	authenticated                               bool
+	handles                                     map[uint64]*os.File
+	nextHandle                                  uint64
+}
+
+func fxU16(p []byte) uint16      { return binary.LittleEndian.Uint16(p) }
+func fxU32(p []byte) uint32      { return binary.LittleEndian.Uint32(p) }
+func fxU64(p []byte) uint64      { return binary.LittleEndian.Uint64(p) }
+func fxPut16(p []byte, x uint16) { binary.LittleEndian.PutUint16(p, x) }
+func fxPut32(p []byte, x uint32) { binary.LittleEndian.PutUint32(p, x) }
+func fxPut64(p []byte, x uint64) { binary.LittleEndian.PutUint64(p, x) }
+func fxUTF16(s string) []byte {
+	units := utf16.Encode([]rune(s))
+	out := make([]byte, len(units)*2)
+	for i, u := range units {
+		fxPut16(out[i*2:], u)
 	}
-	v.mu.Unlock()
-	if (req.Path != "" && req.Path != "\\") || req.CreateDisposition != smb.FileOpen || req.CreateOptions != smb.FileDirectoryFile ||
-		(req.DesiredAccess != smb.DAccMaskFileListDirectory && req.DesiredAccess != smb.DAccMaskFileReadAttributes) {
-		v.record(fmt.Sprintf("unexpected filesystem open: %+v", req))
-		return server.CreateResult{}, smb.StatusAccessDenied, nil
+	return out
+}
+func fxText(data []byte) string {
+	units := make([]uint16, len(data)/2)
+	for i := range units {
+		units[i] = fxU16(data[i*2:])
 	}
-	if attempt == 1 && v.rejectFirstOpen != 0 {
-		return server.CreateResult{}, v.rejectFirstOpen, nil
+	return string(utf16.Decode(units))
+}
+func fxBounds(packet []byte, offset, length uint32) ([]byte, error) {
+	if uint64(offset)+uint64(length) > uint64(len(packet)) {
+		return nil, errors.New("out-of-bounds request field")
 	}
-	if v.denyList && req.DesiredAccess == smb.DAccMaskFileListDirectory {
-		return server.CreateResult{}, smb.StatusAccessDenied, nil
+	return packet[int(offset):int(offset+length)], nil
+}
+func fxDER(tag byte, data []byte) []byte {
+	out := []byte{tag}
+	switch {
+	case len(data) < 128:
+		out = append(out, byte(len(data)))
+	case len(data) < 256:
+		out = append(out, 0x81, byte(len(data)))
+	default:
+		out = append(out, 0x82, byte(len(data)>>8), byte(len(data)))
 	}
-	result, status, err := v.VFS.Create(ctx, session, req)
-	if status == smb.StatusOk && err == nil {
-		v.mu.Lock()
-		v.successful++
-		v.mu.Unlock()
+	return append(out, data...)
+}
+func fxSPNEGO(token []byte, complete bool) []byte {
+	state := byte(1)
+	if complete {
+		state = 0
 	}
-	return result, status, err
+	inner := fxDER(0xa0, fxDER(0x0a, []byte{state}))
+	if token != nil {
+		inner = append(inner, fxDER(0xa1, []byte{6, 10, 43, 6, 1, 4, 1, 130, 55, 2, 2, 10})...)
+		inner = append(inner, fxDER(0xa2, fxDER(4, token))...)
+	}
+	return fxDER(0xa1, fxDER(0x30, inner))
+}
+func fxHMACMD5(key []byte, pieces ...[]byte) []byte {
+	h := hmac.New(md5.New, key)
+	for _, p := range pieces {
+		h.Write(p)
+	}
+	return h.Sum(nil)
+}
+func fxSignature(key, raw []byte) []byte {
+	copyRaw := append([]byte(nil), raw...)
+	clear(copyRaw[48:64])
+	h := hmac.New(sha256.New, key)
+	h.Write(copyRaw)
+	return h.Sum(nil)[:16]
+}
+func (s *fixtureSMBServer) closeHandles() {
+	for id, h := range s.handles {
+		_ = h.Close()
+		delete(s.handles, id)
+		s.fixture.guard.mu.Lock()
+		s.fixture.guard.closed++
+		s.fixture.guard.mu.Unlock()
+	}
+}
+func (s *fixtureSMBServer) serve() {
+	for {
+		_ = s.conn.SetDeadline(time.Now().Add(5 * time.Second))
+		var prefix [4]byte
+		if _, err := io.ReadFull(s.conn, prefix[:]); err != nil {
+			return
+		}
+		n := binary.BigEndian.Uint32(prefix[:])
+		if n < 64 || n > 4<<20 {
+			s.fixture.guard.record("invalid SMB frame length")
+			return
+		}
+		request := make([]byte, n)
+		if _, err := io.ReadFull(s.conn, request); err != nil {
+			return
+		}
+		if string(request[:4]) != "\xfeSMB" || fxU16(request[4:]) != 64 {
+			s.fixture.guard.record("invalid SMB header")
+			return
+		}
+		if fxU32(request[20:]) != 0 {
+			s.fixture.guard.record("unexpected compound SMB request")
+			return
+		}
+		command := fxU16(request[12:])
+		if s.authenticated && len(s.sessionKey) > 0 {
+			if fxU32(request[16:])&8 == 0 || !hmac.Equal(request[48:64], fxSignature(s.sessionKey, request)) {
+				s.fixture.guard.record("missing or incorrect request signature")
+				return
+			}
+		}
+		body, status, tree, err := s.dispatch(command, request)
+		if err != nil {
+			s.fixture.guard.record(err.Error())
+			return
+		}
+		s.fixture.guard.mu.Lock()
+		if tree == 1 && command == s.fixture.guard.deniedIPCCleanup {
+			status = 0xc0000022
+		}
+		s.fixture.guard.mu.Unlock()
+		if status != 0 && status != 0xc0000016 {
+			body = make([]byte, 8)
+			fxPut16(body, 9)
+		}
+		reply := make([]byte, 64+len(body))
+		copy(reply, "\xfeSMB")
+		fxPut16(reply[4:], 64)
+		fxPut16(reply[6:], 1)
+		fxPut32(reply[8:], status)
+		fxPut16(reply[12:], command)
+		fxPut16(reply[14:], 32)
+		fxPut32(reply[16:], 1)
+		copy(reply[24:32], request[24:32])
+		fxPut32(reply[36:], tree)
+		if command != 0 {
+			fxPut64(reply[40:], 1)
+		}
+		copy(reply[64:], body)
+		if s.authenticated && len(s.sessionKey) > 0 {
+			fxPut32(reply[16:], 9)
+			copy(reply[48:], fxSignature(s.sessionKey, reply))
+		}
+		binary.BigEndian.PutUint32(prefix[:], uint32(len(reply)))
+		if _, err := s.conn.Write(append(prefix[:], reply...)); err != nil {
+			return
+		}
+		if command == 2 {
+			return
+		}
+	}
+}
+func (s *fixtureSMBServer) dispatch(command uint16, p []byte) ([]byte, uint32, uint32, error) {
+	tree := fxU32(p[36:])
+	guard := s.fixture.guard
+	if tree == 2 && command != 5 && command != 6 && command != 4 {
+		return nil, 0, tree, fmt.Errorf("unexpected disk SMB command %#x", command)
+	}
+	switch command {
+	case 0: // NEGOTIATE: SMB 2.1, signing enabled/required, no encryption.
+		if len(p) < 100 {
+			return nil, 0, 0, errors.New("short NEGOTIATE")
+		}
+		b := make([]byte, 64)
+		fxPut16(b, 65)
+		fxPut16(b[2:], 3)
+		fxPut16(b[4:], 0x0210)
+		copy(b[8:24], []byte("fixture-smb-guid!"))
+		fxPut32(b[28:], 65536)
+		fxPut32(b[32:], 65536)
+		fxPut32(b[36:], 65536)
+		fxPut64(b[40:], 133000000000000000)
+		fxPut64(b[48:], 133000000000000000)
+		return b, 0, 0, nil
+	case 1:
+		return s.sessionSetup(p)
+	case 2:
+		b := make([]byte, 4)
+		fxPut16(b, 4)
+		return b, 0, 0, nil
+	case 3:
+		if len(p) < 72 {
+			return nil, 0, 0, errors.New("short TREE_CONNECT")
+		}
+		path, err := fxBounds(p, uint32(fxU16(p[68:])), uint32(fxU16(p[70:])))
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		parts := strings.Split(fxText(path), "\\")
+		name := parts[len(parts)-1]
+		b := make([]byte, 16)
+		fxPut16(b, 16)
+		switch strings.ToLower(name) {
+		case "ipc$":
+			tree = 1
+			b[2] = 2
+			fxPut32(b[12:], 0x001f01ff)
+		case "data$":
+			tree = 2
+			b[2] = 1
+			mask := s.shareMask
+			if s.sessionFlags&1 != 0 {
+				mask = 0x00120089
+			}
+			fxPut32(b[12:], mask)
+		default:
+			return nil, 0, 0, fmt.Errorf("unexpected share %q", name)
+		}
+		return b, 0, tree, nil
+	case 4:
+		b := make([]byte, 4)
+		fxPut16(b, 4)
+		return b, 0, tree, nil
+	case 5:
+		return s.create(p, tree)
+	case 6:
+		if len(p) < 88 {
+			return nil, 0, tree, errors.New("short CLOSE")
+		}
+		id := fxU64(p[72:])
+		if tree == 2 {
+			h, ok := s.handles[id]
+			if !ok {
+				return nil, 0, tree, errors.New("closing unknown disk handle")
+			}
+			_ = h.Close()
+			delete(s.handles, id)
+			guard.mu.Lock()
+			guard.closed++
+			guard.mu.Unlock()
+		}
+		b := make([]byte, 60)
+		fxPut16(b, 60)
+		return b, 0, tree, nil
+	case 9: // WRITE is only permitted to the already-existing srvsvc pipe.
+		if tree != 1 || len(p) < 112 || fxU64(p[80:]) != 1 {
+			return nil, 0, tree, errors.New("unexpected SMB WRITE")
+		}
+		data, err := fxBounds(p, uint32(fxU16(p[66:])), fxU32(p[68:]))
+		if err != nil {
+			return nil, 0, tree, err
+		}
+		s.pipeReply, err = fxRPCReply(data)
+		if err != nil {
+			return nil, 0, tree, err
+		}
+		guard.mu.Lock()
+		enumerationStatus := guard.enumerationStatus
+		malformedEnumeration := guard.malformedEnumeration
+		guard.mu.Unlock()
+		if data[2] == 0 && enumerationStatus != 0 {
+			fxPut32(s.pipeReply[len(s.pipeReply)-4:], enumerationStatus)
+		}
+		if data[2] == 0 && malformedEnumeration {
+			fxPut32(s.pipeReply[24:], 2) // Invalid level in the NDR response stub.
+		}
+		b := make([]byte, 16)
+		fxPut16(b, 17)
+		fxPut32(b[4:], uint32(len(data)))
+		return b, 0, tree, nil
+	case 8:
+		if tree != 1 || len(p) < 112 || fxU64(p[80:]) != 1 || len(s.pipeReply) == 0 {
+			return nil, 0, tree, errors.New("unexpected SMB READ")
+		}
+		n := len(s.pipeReply)
+		if n > int(fxU32(p[68:])) {
+			n = int(fxU32(p[68:]))
+		}
+		b := make([]byte, 16+n)
+		fxPut16(b, 17)
+		b[2] = 80
+		fxPut32(b[4:], uint32(n))
+		copy(b[16:], s.pipeReply[:n])
+		s.pipeReply = s.pipeReply[n:]
+		return b, 0, tree, nil
+	default:
+		return nil, 0, tree, fmt.Errorf("unexpected SMB command %#x", command)
+	}
+}
+func (s *fixtureSMBServer) sessionSetup(p []byte) ([]byte, uint32, uint32, error) {
+	if len(p) < 88 {
+		return nil, 0, 0, errors.New("short SESSION_SETUP")
+	}
+	token, err := fxBounds(p, uint32(fxU16(p[76:])), uint32(fxU16(p[78:])))
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	token, err = fxNTLMToken(token)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	typ := fxU32(token[8:])
+	status := uint32(0)
+	var security []byte
+	if typ == 1 {
+		if s.negotiate != nil {
+			return nil, 0, 0, errors.New("duplicate NTLM negotiation")
+		}
+		s.negotiate = append([]byte(nil), token...)
+		s.challenge = fxNTLMChallenge()
+		security = fxSPNEGO(s.challenge, false)
+		status = 0xc0000016
+	} else if typ == 3 {
+		if s.challenge == nil {
+			return nil, 0, 0, errors.New("authentication without challenge")
+		}
+		user, domain, key, valid, empty, err := fxVerifyNTLM(s.negotiate, s.challenge, token, "synthetic-fixture-password")
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		guard := s.fixture.guard
+		guard.mu.Lock()
+		guard.authAttempts++
+		guard.wireUsers = append(guard.wireUsers, user)
+		guard.wireDomains = append(guard.wireDomains, domain)
+		guard.guestEmptyPasswordVerified = empty
+		authenticationStatus := guard.authenticationStatus
+		guard.mu.Unlock()
+		ordinary := valid && user == "audit-user" && domain == "LAB"
+		switch {
+		case authenticationStatus != 0:
+			status = authenticationStatus
+		case s.authMode == "mixed_guest_null":
+			s.sessionFlags = 3
+		case s.authMode == "mixed_guest_encryption":
+			s.sessionFlags = 5
+		case s.authMode == "unknown_session_flag":
+			s.sessionFlags = 8
+			s.sessionKey = key
+		case s.authMode == "smb21_encryption_flag":
+			s.sessionFlags = 4
+			s.sessionKey = key
+		case s.authMode == "force_anonymous":
+			s.sessionFlags = 2
+		case s.authMode == "guest_as_user" && empty:
+			s.sessionKey = key
+		case ordinary:
+			s.sessionKey = key
+		case s.authMode == "map_guest":
+			s.sessionFlags = 1
+		default:
+			status = 0xc000006d
+		}
+		s.authenticated = status == 0
+		security = fxSPNEGO(nil, true)
+	} else {
+		return nil, 0, 0, fmt.Errorf("unexpected NTLM message type %d", typ)
+	}
+	b := make([]byte, 8+len(security))
+	fxPut16(b, 9)
+	fxPut16(b[2:], s.sessionFlags)
+	fxPut16(b[4:], 72)
+	fxPut16(b[6:], uint16(len(security)))
+	copy(b[8:], security)
+	return b, status, 0, nil
 }
 
-func (v *guardedEnumerationVFS) Close(ctx context.Context, handle server.Handle) error {
-	v.mu.Lock()
-	v.closed++
-	v.mu.Unlock()
-	return v.VFS.Close(ctx, handle)
+// Decode the ASN.1 framing independently so an accompanying mechListMIC never
+// becomes part of the NTLM transcript used for the Type3 MIC check.
+func fxNTLMToken(data []byte) ([]byte, error) {
+	if bytes.HasPrefix(data, []byte("NTLMSSP\x00")) {
+		return data, nil
+	}
+	var token []byte
+	var walk func([]byte, int) error
+	walk = func(data []byte, depth int) error {
+		if depth > 8 {
+			return errors.New("fixture SPNEGO nesting exceeded")
+		}
+		for len(data) > 0 {
+			if len(data) < 2 {
+				return errors.New("truncated fixture SPNEGO header")
+			}
+			tag, n, header := data[0], int(data[1]), 2
+			if n&128 != 0 {
+				count := n & 127
+				if count == 0 || count > 3 || len(data) < 2+count {
+					return errors.New("invalid fixture SPNEGO length")
+				}
+				n = 0
+				for _, b := range data[2 : 2+count] {
+					n = n*256 + int(b)
+				}
+				header += count
+			}
+			if n > len(data)-header {
+				return errors.New("truncated fixture SPNEGO field")
+			}
+			value := data[header : header+n]
+			if tag == 4 && bytes.HasPrefix(value, []byte("NTLMSSP\x00")) {
+				if token != nil {
+					return errors.New("duplicate fixture NTLM token")
+				}
+				token = value
+			} else if tag&32 != 0 {
+				if err := walk(value, depth+1); err != nil {
+					return err
+				}
+			}
+			data = data[header+n:]
+		}
+		return nil
+	}
+	if err := walk(data, 0); err != nil {
+		return nil, err
+	}
+	if len(token) < 12 {
+		return nil, errors.New("missing NTLM authentication token")
+	}
+	return token, nil
 }
 
-func (v *guardedEnumerationVFS) Write(context.Context, server.Handle, int64, []byte) (int, uint32, error) {
-	v.record("filesystem Write")
-	return 0, smb.StatusAccessDenied, nil
+func fxNTLMChallenge() []byte {
+	target := fxUTF16("LAB")
+	var info []byte
+	for _, av := range []struct {
+		id    uint16
+		value []byte
+	}{{2, fxUTF16("LAB")}, {1, fxUTF16("LOOPBACK-TEST")}, {7, make([]byte, 8)}, {0, nil}} {
+		if av.id == 7 {
+			fxPut64(av.value, uint64(time.Now().UnixNano()/100+116444736000000000))
+		}
+		header := make([]byte, 4)
+		fxPut16(header, av.id)
+		fxPut16(header[2:], uint16(len(av.value)))
+		info = append(info, header...)
+		info = append(info, av.value...)
+	}
+	out := make([]byte, 56+len(target)+len(info))
+	copy(out, "NTLMSSP\x00")
+	fxPut32(out[8:], 2)
+	fxPut16(out[12:], uint16(len(target)))
+	fxPut16(out[14:], uint16(len(target)))
+	fxPut32(out[16:], 56)
+	fxPut32(out[20:], 0xe2888215)
+	copy(out[24:32], []byte{1, 35, 69, 103, 137, 171, 205, 239})
+	fxPut16(out[40:], uint16(len(info)))
+	fxPut16(out[42:], uint16(len(info)))
+	fxPut32(out[44:], uint32(56+len(target)))
+	copy(out[48:56], []byte{10, 0, 0x63, 0x45, 0, 0, 0, 15})
+	copy(out[56:], target)
+	copy(out[56+len(target):], info)
+	return out
+}
+func fxVerifyNTLM(negotiate, challenge, auth []byte, password string) (user, domain string, key []byte, valid, empty bool, err error) {
+	if len(auth) < 64 {
+		err = errors.New("short NTLM AUTHENTICATE")
+		return
+	}
+	field := func(at int) ([]byte, error) { return fxBounds(auth, fxU32(auth[at+4:]), uint32(fxU16(auth[at:]))) }
+	nt, e := field(20)
+	if e != nil {
+		err = e
+		return
+	}
+	d, e := field(28)
+	if e != nil {
+		err = e
+		return
+	}
+	u, e := field(36)
+	if e != nil {
+		err = e
+		return
+	}
+	encrypted, e := field(52)
+	if e != nil {
+		err = e
+		return
+	}
+	if len(u)%2 != 0 || len(d)%2 != 0 || len(nt) < 48 {
+		err = errors.New("invalid NTLMv2 fields")
+		return
+	}
+	user, domain = fxText(u), fxText(d)
+	check := func(secret string) ([]byte, bool) {
+		h := md4.New()
+		h.Write(fxUTF16(secret))
+		responseKey := fxHMACMD5(h.Sum(nil), fxUTF16(strings.ToUpper(user)+domain))
+		expected := fxHMACMD5(responseKey, challenge[24:32], nt[16:])
+		if !hmac.Equal(expected, nt[:16]) {
+			return nil, false
+		}
+		base := fxHMACMD5(responseKey, nt[:16])
+		exported := base
+		if fxU32(auth[60:])&0x40000000 != 0 {
+			if len(encrypted) != 16 {
+				return nil, false
+			}
+			stream, e := rc4.NewCipher(base)
+			if e != nil {
+				return nil, false
+			}
+			exported = make([]byte, 16)
+			stream.XORKeyStream(exported, encrypted)
+		}
+		// Timestamp in the challenge requires a MIC. Independently check all three
+		// NTLM messages and the exact client AUTHENTICATE bytes with its MIC zeroed.
+		micOffset := 64
+		if fxU32(auth[60:])&0x02000000 != 0 {
+			micOffset = 72
+		}
+		if len(auth) < micOffset+16 {
+			return nil, false
+		}
+		cleared := append([]byte(nil), auth...)
+		clear(cleared[micOffset : micOffset+16])
+		mic := fxHMACMD5(exported, negotiate, challenge, cleared)
+		if !hmac.Equal(mic, auth[micOffset:micOffset+16]) {
+			return nil, false
+		}
+		return exported, true
+	}
+	key, valid = check(password)
+	if user == "" {
+		var emptyKey []byte
+		emptyKey, empty = check("")
+		if empty {
+			key = emptyKey
+		}
+	}
+	return
+}
+func (s *fixtureSMBServer) create(p []byte, tree uint32) ([]byte, uint32, uint32, error) {
+	if len(p) < 120 {
+		return nil, 0, tree, errors.New("short CREATE")
+	}
+	path, err := fxBounds(p, uint32(fxU16(p[108:])), uint32(fxU16(p[110:])))
+	if err != nil {
+		return nil, 0, tree, err
+	}
+	desired, disposition, options := fxU32(p[88:]), fxU32(p[100:]), fxU32(p[104:])
+	id := uint64(1)
+	var contexts []byte
+	if tree == 1 {
+		if strings.TrimPrefix(fxText(path), "\\") != "srvsvc" || disposition != 1 || desired&^uint32(0x00100003) != 0 {
+			return nil, 0, tree, errors.New("unexpected pipe open")
+		}
+	} else if tree == 2 {
+		guard := s.fixture.guard
+		guard.mu.Lock()
+		guard.opens++
+		attempt := guard.opens
+		if s.sessionFlags&1 != 0 {
+			guard.guestOpens++
+		}
+		guard.mu.Unlock()
+		if len(path) != 0 || disposition != 1 || options != 1 || (desired != 1 && desired != 0x80) || p[67] != 0 || fxU32(p[96:]) != 7 {
+			return nil, 0, tree, errors.New("root open requested mutation, child access, or exclusive locking")
+		}
+		cc, err := fxBounds(p, fxU32(p[112:]), fxU32(p[116:]))
+		if err != nil {
+			return nil, 0, tree, err
+		}
+		if attempt > 1 && guard.rejectFirstOpen != 0 {
+			if len(cc) != 0 {
+				return nil, 0, tree, errors.New("unsupported-metadata fallback included contexts")
+			}
+		} else if len(cc) < 20 || string(cc[16:20]) != "MxAc" || fxU32(cc[12:]) != 0 {
+			return nil, 0, tree, errors.New("root open did not request fresh MxAc metadata")
+		}
+		if attempt == 1 && guard.rejectFirstOpen != 0 {
+			return nil, guard.rejectFirstOpen, tree, nil
+		}
+		if guard.denyList && desired == 1 {
+			return nil, 0xc0000022, tree, nil
+		}
+		handle, err := os.Open(s.fixture.root)
+		if err != nil {
+			return nil, 0, tree, err
+		}
+		id = s.nextHandle
+		s.nextHandle++
+		s.handles[id] = handle
+		guard.mu.Lock()
+		guard.successful++
+		guard.mu.Unlock()
+		if s.contextMode != "absent" && s.contextMode != "unsupported" && s.contextMode != "invalid_parameter" {
+			contexts = make([]byte, 32)
+			fxPut16(contexts[4:], 16)
+			fxPut16(contexts[6:], 4)
+			fxPut16(contexts[10:], 24)
+			fxPut32(contexts[12:], 8)
+			copy(contexts[16:], "MxAc")
+			mask := s.objectMask
+			if s.sessionFlags&1 != 0 {
+				mask = 0x00120089
+			}
+			fxPut32(contexts[28:], mask)
+			if s.contextMode == "failed" {
+				fxPut32(contexts[24:], 0xc0000022)
+			}
+			if s.contextMode == "malformed" {
+				contexts = contexts[:28]
+			}
+		}
+	} else {
+		return nil, 0, tree, errors.New("CREATE on unknown tree")
+	}
+	b := make([]byte, 88+len(contexts))
+	fxPut16(b, 89)
+	fxPut32(b[4:], 1)
+	fxPut64(b[64:], id)
+	if len(contexts) > 0 {
+		fxPut32(b[80:], 152)
+		fxPut32(b[84:], uint32(len(contexts)))
+		copy(b[88:], contexts)
+	}
+	return b, 0, tree, nil
 }
 
-func (v *guardedEnumerationVFS) SetFileInfo(context.Context, server.Handle, byte, []byte) (uint32, error) {
-	v.record("filesystem SetFileInfo (rename/delete/truncate/attribute change)")
-	return smb.StatusAccessDenied, nil
+func fxRPCReply(request []byte) ([]byte, error) {
+	if len(request) < 16 || request[0] != 5 || request[1] != 0 || request[3]&3 != 3 || int(fxU16(request[8:])) != len(request) {
+		return nil, errors.New("invalid or fragmented fixture RPC request")
+	}
+	var body []byte
+	packetType := byte(0)
+	switch request[2] {
+	case 11: // bind_ack accepting NDR32 v2 context zero.
+		if len(request) < 72 {
+			return nil, errors.New("short RPC bind")
+		}
+		srvsvcID := []byte{0xc8, 0x4f, 0x32, 0x4b, 0x70, 0x16, 0xd3, 0x01, 0x12, 0x78, 0x5a, 0x47, 0xbf, 0x6e, 0xe1, 0x88}
+		ndrID := []byte{4, 93, 136, 138, 235, 28, 201, 17, 159, 232, 8, 0, 43, 16, 72, 96}
+		if request[24] != 1 || fxU16(request[28:]) != 0 || request[30] != 1 || !bytes.Equal(request[32:48], srvsvcID) || fxU32(request[48:]) != 3 || !bytes.Equal(request[52:68], ndrID) || fxU32(request[68:]) != 2 {
+			return nil, errors.New("RPC bind did not request SRVSVC v3 over NDR32 v2")
+		}
+		packetType = 12
+		body = make([]byte, 40)
+		fxPut16(body, 4280)
+		fxPut16(body[2:], 4280)
+		body[12] = 1
+		copy(body[20:36], []byte{4, 93, 136, 138, 235, 28, 201, 17, 159, 232, 8, 0, 43, 16, 72, 96})
+		fxPut32(body[36:], 2)
+	case 0:
+		if len(request) < 24 || fxU16(request[20:]) != 0 || fxU16(request[22:]) != 15 {
+			return nil, errors.New("unexpected RPC operation")
+		}
+		packetType = 2
+		stub := fxShareList()
+		body = make([]byte, 8+len(stub))
+		fxPut32(body, uint32(len(stub)))
+		copy(body[8:], stub)
+	default:
+		return nil, fmt.Errorf("unexpected RPC packet type %d", request[2])
+	}
+	out := make([]byte, 16+len(body))
+	out[0] = 5
+	out[2] = packetType
+	out[3] = 3
+	out[4] = 16
+	fxPut16(out[8:], uint16(len(out)))
+	copy(out[12:16], request[12:16])
+	copy(out[16:], body)
+	return out, nil
 }
-
-func (v *guardedEnumerationVFS) Ioctl(context.Context, server.Handle, uint32, []byte, uint32) ([]byte, uint32, error) {
-	v.record("filesystem IOCTL")
-	return nil, smb.StatusAccessDenied, nil
-}
-
-func (v *guardedEnumerationVFS) Read(context.Context, server.Handle, int64, []byte) (int, uint32, error) {
-	v.record("unexpected file contents read")
-	return 0, smb.StatusAccessDenied, nil
-}
-
-func (v *guardedEnumerationVFS) QueryDirectory(context.Context, server.Handle, string, bool) ([]server.DirEntry, uint32, error) {
-	v.record("unexpected child listing")
-	return nil, smb.StatusAccessDenied, nil
+func fxShareList() []byte {
+	// NDR32: level/switch, unique container, count, unique conformant array,
+	// the fixed SHARE_INFO_1 records, then their deferred strings.
+	var out []byte
+	put := func(n uint32) { b := make([]byte, 4); fxPut32(b, n); out = append(out, b...) }
+	put(1)
+	put(1)
+	put(0x20000)
+	put(3)
+	put(0x20004)
+	put(3)
+	shares := []struct {
+		name    string
+		kind    uint32
+		comment string
+	}{{"data$", 0x80000000, "fixture disk"}, {"IPC$", 0x80000003, "fixture RPC"}, {"printer", 1, "must not be probed"}}
+	for i, share := range shares {
+		put(uint32(0x20008 + i*8))
+		put(share.kind)
+		put(uint32(0x2000c + i*8))
+	}
+	for _, share := range shares {
+		for _, text := range []string{share.name, share.comment} {
+			data := fxUTF16(text + "\x00")
+			put(uint32(len(data) / 2))
+			put(0)
+			put(uint32(len(data) / 2))
+			out = append(out, data...)
+			for len(out)%4 != 0 {
+				out = append(out, 0)
+			}
+		}
+	}
+	put(3)
+	put(0x20030)
+	put(0)
+	put(0)
+	return out
 }

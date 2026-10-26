@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -96,11 +98,74 @@ func TestDialerUsesExplicitIPv6Destination(t *testing.T) {
 	}()
 	d := boundedDialer{ctx: context.Background(), target: listener.Addr().String(), timeout: time.Second}
 	defer d.close()
-	// The dependency's malformed IPv6 spelling must never be used for dialing.
-	conn, err := d.DialContext(context.Background(), "tcp", "::1:1")
+	conn, err := d.Dial()
 	if err != nil {
 		t.Fatal(err)
 	}
 	conn.Close()
 	<-accepted
+}
+
+func TestDialerAllowsOnlyOneAttempt(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	d := &boundedDialer{ctx: context.Background(), target: listener.Addr().String(), timeout: time.Second}
+	defer d.close()
+
+	// Even concurrent callers cannot replace the first socket or trigger a retry.
+	var callers sync.WaitGroup
+	connections := make(chan net.Conn, 8)
+	for range cap(connections) {
+		callers.Go(func() {
+			conn, _ := d.Dial()
+			connections <- conn
+		})
+	}
+	callers.Wait()
+	close(connections)
+	count := 0
+	for conn := range connections {
+		if conn != nil {
+			count++
+			defer conn.Close()
+		}
+	}
+	if count != 1 {
+		t.Fatalf("established %d TCP connections, want exactly one", count)
+	}
+}
+
+func TestDialerDoesNotRetryFailedAttempt(t *testing.T) {
+	d := &boundedDialer{ctx: context.Background(), target: "missing-port"}
+	if _, err := d.Dial(); err == nil {
+		t.Fatal("malformed endpoint unexpectedly connected")
+	}
+	if _, err := d.Dial(); err == nil || err.Error() != "SMB target already dialed" {
+		t.Fatalf("failed dial permitted a second attempt: %v", err)
+	}
+}
+
+func TestClientCloseStopsFurtherScannerOperations(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	d := &boundedDialer{ctx: context.Background(), conn: client, reached: true}
+	conn := &trackedConn{Conn: client, owner: d}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(d.err(), net.ErrClosed) || !errors.Is(d.arm(), net.ErrClosed) {
+		t.Fatal("client closed a failed transport without notifying the scanner")
+	}
+	if !d.reachable() {
+		t.Fatal("closing a connection lost its established reachability")
+	}
+	if _, err := d.Dial(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closed transport allowed another dial: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("repeated cleanup is not idempotent: %v", err)
+	}
 }

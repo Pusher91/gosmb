@@ -1,72 +1,47 @@
 package main
 
 import (
-	"errors"
+	"fmt"
+	"reflect"
 	"testing"
 
-	"github.com/jfjallid/go-smb/dcerpc/mssrvs"
+	"gosmb/internal/smbwire"
 )
 
-func sharePage(t *testing.T, names []string, status uint32, resume uint32) []byte {
-	t.Helper()
-	entries := make([]mssrvs.ShareInfo1, len(names))
-	for i, name := range names {
-		entries[i] = mssrvs.ShareInfo1{Name: name, Comment: "fixture"}
+func BenchmarkDiscoveredShares(b *testing.B) {
+	shares := make([]smbwire.Share, 1000)
+	for i := range shares {
+		shares[i] = smbwire.Share{Name: fmt.Sprintf("Department-%04d-Archives", (i*37)%len(shares))}
 	}
-	page := mssrvs.NetShareEnumAllResponse{
-		InfoStruct:   mssrvs.ShareEnumStruct{Level: 1, Level1: &mssrvs.ShareInfoContainer1{EntriesRead: uint32(len(entries)), Buffer: entries}},
-		TotalEntries: uint32(len(entries)), ResumeHandle: &resume, WindowsError: status,
-	}
-	result, err := page.Marshal()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return result
-}
-
-func TestEnumerationFollowsResumeCursorAndKeepsHiddenShares(t *testing.T) {
-	calls := 0
-	shares, err := enumeratePages("fixture", func(body []byte) ([]byte, error) {
-		var request mssrvs.NetShareEnumAllRequest
-		if err := request.Unmarshal(body); err != nil {
-			t.Fatal(err)
-		}
-		calls++
-		if request.InfoStruct.Level != 1 {
-			t.Fatal("enumeration requested unnecessary extended metadata")
-		}
-		if calls == 1 {
-			return sharePage(t, []string{"data", "hidden$"}, 234, 7), nil
-		}
-		if calls != 2 || request.ResumeHandle == nil || *request.ResumeHandle != 7 {
-			t.Fatal("incorrect pagination cursor or extra request")
-		}
-		return sharePage(t, []string{"DATA", "last"}, 0, 0), nil
-	})
-	if err != nil || calls != 2 || len(shares) != 3 || shares[1].Name != "hidden$" || shares[2].Name != "last" {
-		t.Fatalf("enumeration: %+v, %v, calls=%d", shares, err, calls)
+	b.ReportAllocs()
+	for b.Loop() {
+		discoveredShares(shares)
 	}
 }
 
-func TestEnumerationStopsOnRepeatedCursor(t *testing.T) {
-	calls := 0
-	shares, err := enumeratePages("fixture", func([]byte) ([]byte, error) {
-		calls++
-		return sharePage(t, []string{"data"}, 234, 5), nil
-	})
-	if err == nil || calls != 2 || len(shares) != 1 {
-		t.Fatalf("repeated cursor was not bounded: calls=%d shares=%v error=%v", calls, shares, err)
+func TestDiscoveredSharesPreservesNamesMetadataAndStableOrder(t *testing.T) {
+	shares := []smbwire.Share{
+		{Name: "Zebra", Type: 1, Comment: "printer"},
+		{Name: "équipe", Type: 0x80000000, Comment: "first equivalent name"},
+		{Name: "alpha", Type: 3, Comment: "pipe"},
+		{Name: "ÉQUIPE", Type: 0x40000000, Comment: "second equivalent name"},
+		{Name: "ALPHA", Type: 2, Comment: "device"},
+		{Name: "Ω", Type: 9, Comment: "other"},
 	}
-}
-
-func TestEnumerationDeniedDoesNotRetry(t *testing.T) {
-	calls := 0
-	_, err := enumeratePages("fixture", func([]byte) ([]byte, error) {
-		calls++
-		return sharePage(t, nil, 5, 0), nil
-	})
-	if !errors.Is(err, errRPCDenied) || calls != 1 {
-		t.Fatalf("access denial: calls=%d error=%v", calls, err)
+	original := append([]smbwire.Share(nil), shares...)
+	want := []discoveredShare{
+		{Name: "alpha", Type: "ipc", Comment: "pipe"},
+		{Name: "ALPHA", Type: "device", Comment: "device"},
+		{Name: "Zebra", Type: "printer", Comment: "printer"},
+		{Name: "équipe", Type: "disk", Comment: "first equivalent name"},
+		{Name: "ÉQUIPE", Type: "disk", Comment: "second equivalent name"},
+		{Name: "Ω", Type: "other", Comment: "other"},
+	}
+	if got := discoveredShares(shares); !reflect.DeepEqual(got, want) {
+		t.Fatalf("share ordering or metadata changed: got %+v, want %+v", got, want)
+	}
+	if !reflect.DeepEqual(shares, original) {
+		t.Fatal("share preparation changed the protocol results")
 	}
 }
 

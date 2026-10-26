@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 
@@ -30,12 +29,15 @@ func promptPassword(ctx context.Context, in io.Reader, out io.Writer) (password 
 			password = ""
 			err = errors.Join(err, errors.New("could not restore password terminal"))
 		}
-		fmt.Fprintln(out)
+		if _, writeErr := writeOutputString(out, "\n"); writeErr != nil {
+			password = ""
+			err = errors.Join(err, writeErr)
+		}
 	}()
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	if _, err := fmt.Fprint(out, "Password: "); err != nil {
+	if _, err := writeOutputString(out, "Password: "); err != nil {
 		return "", err
 	}
 	reader := &passwordInput{ctx: ctx, in: f}
@@ -56,6 +58,10 @@ func readPromptLine(in io.Reader) (string, error) {
 	var buf [1]byte
 	for {
 		n, err := in.Read(buf[:])
+		if err != nil && !errors.Is(err, io.EOF) {
+			// Report input failures even when the same read completes the line.
+			return "", err
+		}
 		if n > 0 {
 			switch buf[0] {
 			case '\r', '\n':
@@ -67,10 +73,9 @@ func readPromptLine(in io.Reader) (string, error) {
 			default:
 				password = append(password, buf[0])
 			}
-			continue
 		}
 		if err != nil {
-			if errors.Is(err, io.EOF) && len(password) > 0 {
+			if len(password) > 0 {
 				return string(password), nil
 			}
 			return "", err

@@ -10,21 +10,22 @@ import (
 
 // boundedDialer retains the socket so cancellation and deadlines cover SMB
 // negotiation, authentication and RPC, not just the initial TCP connection.
-// It is passed through the library's ProxyDialer interface; it is not a proxy.
+// It is passed directly to the in-repository SMB client.
 type boundedDialer struct {
 	ctx        context.Context
 	target     string
 	timeout    time.Duration
 	mu         sync.Mutex
 	conn       net.Conn
+	attempted  bool
 	closed     bool
 	reached    bool
 	peerIP     string
 	timeoutErr error
 }
 
-// The SMB library does not consistently wrap underlying I/O errors. Retain
-// typed timeouts at the socket boundary instead of guessing from error text.
+// Retain typed timeouts at the socket boundary so protocol error wrapping
+// cannot lose their classification.
 type trackedConn struct {
 	net.Conn
 	owner *boundedDialer
@@ -42,6 +43,10 @@ func (c *trackedConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// A protocol failure closes the client connection directly. Keep the owner in
+// sync so the scanner stops issuing operations on the poisoned transport.
+func (c *trackedConn) Close() error { return c.owner.closeSocket() }
+
 func (d *boundedDialer) recordTimeout(err error) {
 	var networkError net.Error
 	if !errors.Is(err, context.DeadlineExceeded) && !(errors.As(err, &networkError) && networkError.Timeout()) {
@@ -51,12 +56,9 @@ func (d *boundedDialer) recordTimeout(err error) {
 	if d.timeoutErr == nil {
 		d.timeoutErr = err
 	}
-	c := d.conn
 	d.mu.Unlock()
 	// A timed-out SMB exchange cannot safely be retried on the same stream.
-	if c != nil {
-		_ = c.Close()
-	}
+	d.close()
 }
 
 func (d *boundedDialer) timedOut() bool {
@@ -83,22 +85,27 @@ func (d *boundedDialer) err() error {
 	return nil
 }
 
-func (d *boundedDialer) Dial(network, address string) (net.Conn, error) {
-	return d.DialContext(d.ctx, network, address)
-}
-
-func (d *boundedDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	dialCtx, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(d.ctx, cancel)
-	defer cancel()
-	defer stop()
-	// Keep the dial destination tied to the explicit user target. In particular,
-	// the library formats IPv6 addresses without brackets; JoinHostPort was
-	// already applied when this dialer was constructed.
-	if d.target != "" {
-		address = d.target
+func (d *boundedDialer) Dial() (net.Conn, error) {
+	d.mu.Lock()
+	if err := d.ctx.Err(); err != nil {
+		d.mu.Unlock()
+		return nil, err
 	}
-	c, err := (&net.Dialer{Timeout: d.timeout}).DialContext(dialCtx, network, address)
+	if d.closed {
+		d.mu.Unlock()
+		return nil, net.ErrClosed
+	}
+	if d.attempted {
+		d.mu.Unlock()
+		return nil, errors.New("SMB target already dialed")
+	}
+	d.attempted = true
+	d.mu.Unlock()
+
+	// Try resolved addresses serially and stop at the first success. Disabling
+	// parallel IPv4/IPv6 racing prevents a second connected socket while keeping
+	// hostname fallback within the same connection timeout and host context.
+	c, err := (&net.Dialer{Timeout: d.timeout, FallbackDelay: -1}).DialContext(d.ctx, "tcp", d.target)
 	if err != nil {
 		d.recordTimeout(err)
 		return nil, err
@@ -114,11 +121,11 @@ func (d *boundedDialer) DialContext(ctx context.Context, network, address string
 		}
 		return nil, net.ErrClosed
 	}
-	d.conn = c
 	if err := c.SetDeadline(d.deadline()); err != nil {
 		c.Close()
 		return nil, err
 	}
+	d.conn = c
 	return &trackedConn{Conn: c, owner: d}, nil
 }
 
@@ -149,12 +156,18 @@ func (d *boundedDialer) arm() error {
 }
 
 func (d *boundedDialer) close() {
+	_ = d.closeSocket()
+}
+
+func (d *boundedDialer) closeSocket() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.closed = true
-	if d.conn != nil {
-		d.conn.Close()
+	c := d.conn
+	d.closed, d.conn = true, nil
+	d.mu.Unlock()
+	if c != nil {
+		return c.Close()
 	}
+	return nil
 }
 
 func (d *boundedDialer) reachable() bool {

@@ -1,37 +1,40 @@
 # gosmb
 
-A small, read-only SMB share permission checker. Supply one server or a local
-text file containing servers. It reports TCP reachability, authentication,
-enumeration status, every share returned by the server, and root read/write
-permissions for disk shares.
+A small, read-only SMB share permission checker. Supply one server, an IPv4/IPv6
+CIDR range, or a local text file containing servers and ranges. It reports TCP
+reachability, authentication, enumeration status, every share returned by the
+server, and root read/write permissions for disk shares.
 
 ```sh
 gosmb fileserver.example.com -u alice -p 'password'
 gosmb servers.txt -u 'EXAMPLE\alice' -p 'password'
+gosmb 192.0.2.0/30 -u alice
 gosmb fileserver.example.com --guest
 ```
 
-Run `gosmb` without arguments for usage and examples, or `gosmb --help` for all
-options. Neither command connects to a server or prompts for credentials.
+Run `gosmb`, `gosmb --help`, or `gosmb -h` for the same full help text.
+An explicit help option takes precedence over other scan arguments, including
+invalid options, without looking up credentials, prompting, or connecting.
+Tokens used as option values or placed after `--` are not treated as help options.
 
 Omit `-p` for a hidden password prompt. `GOSMB_PASSWORD` is also supported. An
 explicit `-p ''` supplies an empty password. Command-line passwords can appear in
 process arguments and shell history; the application never logs credentials.
 
 If the server maps supplied credentials to Guest, the scan continues using that
-same session and reports Guest's permissions with **GUEST FALLBACK = TRUE**.
+same session and reports Guest's permissions with **GUEST = TRUE**.
 There is no second login attempt. This reports the server's guest-session flag;
 it does not claim the supplied account/password was validated.
 
 Use `--guest` to request guest access explicitly, without `-u`, `-p`, or `-d`.
 This ignores `GOSMB_PASSWORD` and never prompts. Explicit guest access is labeled
-`authentication=guest` with `GUEST FALLBACK = FALSE`, because guest was requested
+`authentication=guest` with `GUEST = FALSE`, because guest was requested
 from the start. Anonymous/null sessions are a different mode and are not accepted.
 The server must allow guest access. Guest sessions lack SMB signing/encryption;
 ordinary authenticated user sessions continue to require signing.
-The pinned SMB library can reject servers that declare Guest in the first
-authentication response while signing is required. Such handshakes are reported
-as errors; the scanner does not make a second attempt with weaker settings.
+Authentication requires the NTLM challenge/response exchange. Servers that
+skip the challenge are reported as errors; the scanner does not make a second
+authentication attempt.
 
 ## Strictly read-only
 
@@ -47,6 +50,13 @@ one host is scanned at a time. `--concurrency=N` permits up to N simultaneous
 host scans, each with its own connection. The minimum interval between starting
 hosts is 250 ms across all workers (`--delay=0` disables it). Authentication
 failures are not retried.
+
+Resolved addresses are tried serially until one TCP connection succeeds;
+IPv4/IPv6 connections are not raced in parallel. DNS resolution and connection
+attempts share the connection timeout, and SMB authentication starts only on
+the connected socket.
+A trailing DNS dot is preserved: `fileserver.` remains an absolute name and
+is distinct from `fileserver`, which can use resolver search suffixes.
 
 For each disk share it normally performs a tree connect, one read-only open of
 the **existing root directory**, closes that handle, and disconnects the tree.
@@ -69,7 +79,8 @@ Read-only checks are not invisible or guaranteed to produce no server records.
 
 | Field | Meaning |
 | --- | --- |
-| `SMB_SERVER_IP` | The supplied target IP, retained even if the connection fails, times out, or is canceled. For hostname targets, the connected peer's IP is used when available; otherwise `UNKNOWN`. JSON `server_ip` follows the same rule. |
+| `TARGET_IP` | The supplied literal IP or connected peer's IP plus the requested port, using `[IPv6]:port` for IPv6. If no IP is available, this is `UNKNOWN:port`. |
+| `target` / `server_ip` (JSON) | `target` retains the requested hostname/IP and port. `server_ip` contains the supplied literal IP or connected peer's IP without the port, or an empty string when unavailable. |
 | `SHARE` | The share whose permissions appear on this row. |
 | `reachable` (JSON) | The TCP connection succeeded; this alone does not confirm a working SMB service. |
 | `authentication` (JSON) | The server-reported session identity: authenticated user or guest. Anonymous/unverified sessions are labeled and rejected. |
@@ -77,22 +88,29 @@ Read-only checks are not invisible or guaranteed to produce no server records.
 | `accessible` (JSON) | Whether the actual session identity could connect to this disk share. This is separate from its read/write permissions. |
 | `READ` | Whether a read-only root open granting LIST_DIRECTORY succeeded. This does not prove access to each file inside. |
 | `WRITE` | Permission to **add a file at the root**, reported by the share and root maximum-access masks. No write is attempted. |
-| `GUEST_FALLBACK` | `TRUE` when a supplied-credential login was accepted as Guest; the permissions on that row belong to Guest. `FALSE` means no fallback was observed, not necessarily that authentication succeeded. |
+| `GUEST` | `TRUE` when a supplied-credential login was accepted as Guest; the permissions on that row belong to Guest. `FALSE` means no fallback was observed, not necessarily that authentication succeeded. |
+| `HOSTNAME` | The supplied hostname, preserved on both successful and failed connections. Literal IP targets, including addresses expanded from CIDR ranges, show `-`; no reverse DNS lookup is performed. This is the last text/TSV column so long hostnames do not shift the preceding columns. |
 
 In a terminal, columns are padded with spaces to line up with their headers:
 
 ```text
-SMB_SERVER_IP  SHARE    READ   WRITE  GUEST_FALLBACK
-192.0.2.10     public   TRUE   FALSE  TRUE
-192.0.2.10     private  FALSE  FALSE  TRUE
+TARGET_IP                                        SHARE                             READ     WRITE    GUEST    HOSTNAME
+192.0.2.10:445                                   public                            TRUE     FALSE    TRUE     fileserver.example.com
+192.0.2.10:1445                                  private                           FALSE    FALSE    TRUE     -
+UNKNOWN:445                                      -                                 UNKNOWN  UNKNOWN  FALSE    unavailable.example.com
 ```
 
 Text results print in completion order as soon as each host finishes, so already printed results
-remain in the terminal if the process is interrupted or killed. Terminal columns
-have fixed widths; long names continue on additional lines within their columns
-without being truncated. When piped or redirected, output automatically uses
+remain in the terminal if the process is interrupted or killed. Each row is
+emitted on one line, without wrapping or truncating values. Terminal columns
+are padded with spaces, with the full hostname in the last column. When piped
+or redirected, output automatically uses
 plain TSV (tab-separated values), with one full row per share. Use `--tsv` to
-force TSV even in a terminal. Both formats have the same five columns.
+force TSV even in a terminal. Both formats have the same six columns. The
+`TARGET_IP` column always includes the port, including the default `445`; for
+example, `[2001:db8::10]:445` or `UNKNOWN:1445`. The original hostname stays
+visible in `HOSTNAME` even when the connection fails or resolves to an IP.
+JSON keeps the requested endpoint and server IP in separate fields.
 
 A live footer beneath the output shows, for example,
 `Progress: 50% (2/4 hosts completed)`. It starts at 0% and updates after each
@@ -163,25 +181,49 @@ probed as disk shares.
 ## Targets and options
 
 ```text
-# servers.txt: one hostname or IP address per line
+# servers.txt: one hostname, IP address, or CIDR range per line
 fileserver.example.com
 192.0.2.10
 192.0.2.11:1445
 fileserver-two.example.com:1445
 [2001:db8::10]:445
+192.0.2.0/30
+192.0.2.8/30:1445
+2001:db8::/126
+[2001:db8:1::/126]:1445
 ```
 
 Each command-line target or list-file entry can specify its own port with
-`host:port` or `[IPv6]:port`. If the port is omitted, **445** is used.
+`host:port`, `[IPv6]:port`, `IPv4/prefix:port`, or `[IPv6/prefix]:port`.
+If the port is omitted, **445** is used for every address.
 
 Blank lines and lines starting with `#` are ignored. Duplicate endpoints are
-removed. Pass the list-file path as the positional target; existing regular
-files are detected automatically. URLs, UNC paths, CIDR ranges, and implicit
+removed, preserving their first occurrence, including overlaps between CIDR
+ranges and individual IP targets. IPv4 and its unscoped mapped IPv6 spelling
+(such as `192.0.2.1` and `::ffff:192.0.2.1`) count as one endpoint, retaining
+the first spelling. The same address with different ports is treated as separate
+endpoints. Pass the list-file path as the positional target;
+existing regular files are detected automatically. URLs, UNC paths, and implicit
 network discovery are not accepted.
+
+CIDR ranges expand in ascending address order and include every address,
+including IPv4 network and broadcast addresses. Host bits are masked to the
+network prefix: `192.0.2.10/30` expands to `192.0.2.8` through `192.0.2.11`.
+Each range must contain no more than **65,536 addresses**, and a run accepts at
+most **65,536 unique endpoints** after deduplication. Larger ranges are rejected
+before expansion.
+
+The existing concurrency, delay, and timeout settings apply to each expanded
+host. Progress counts expanded endpoints, and results identify each host by its
+individual IP and port with `-` in the `HOSTNAME` column. These are the same
+read-only checks used for individual targets.
 
 ```sh
 gosmb servers.txt -u alice -d EXAMPLE
 gosmb 192.0.2.10:1445 -u alice
+gosmb 192.0.2.0/30 -u alice --concurrency=4
+gosmb 192.0.2.0/30:1445 -u alice
+gosmb '[2001:db8::/126]:1445' -u alice
 gosmb fileserver -u alice --timeout 5s
 gosmb servers.txt -u alice --concurrency=5 --host-timeout=30
 gosmb servers.txt -u alice --delay 1s --json
@@ -207,8 +249,9 @@ The existing `--timeout` defaults to **10 seconds per SMB exchange/RPC operation
 and accepts duration syntax such as `--timeout=5s`. Whichever limit expires first
 stops the host scan. Neither timeout causes another authentication attempt.
 
-Ctrl-C closes active sockets and stops starting subsequent targets. Ctrl-C/SIGTERM
-also cancels a password prompt immediately and restores the terminal settings.
+Ctrl-C/SIGTERM stops host-list parsing between records and bounded CIDR expansions,
+closes active sockets, and stops starting subsequent targets. It also cancels a
+password prompt immediately and restores the terminal settings.
 JSON output is an
 array; `server_ip` and the Boolean `guest_fallback` apply to every share in that
 server's result, while `read_root`, `write_root`, and `write_basis` retain explicit semantics.
@@ -217,7 +260,8 @@ and diagnostics are sent to stderr, leaving stdout suitable for pipelines.
 
 Exit codes: `0` when every scanned server established an accepted user/guest
 session and enumeration completed,
-`1` for connection/authentication/enumeration failures, timeouts, or cancellation, and `2`
+`1` for connection/authentication/enumeration failures, fatal protocol or cleanup
+failures, timeouts, or cancellation, and `2`
 for invalid input. Denied shares and unavailable write metadata are normal
 results and do not alone cause a nonzero exit code. Results are printed to stdout;
 the tool does not save a report or credentials automatically.
@@ -228,7 +272,7 @@ Use Go 1.27.3 or a newer patched release. `go.mod` recommends 1.27.3 so Go's
 automatic toolchain selection does not choose the original 1.27.0 release.
 
 ```sh
-go build -trimpath -o gosmb .
+CGO_ENABLED=0 go build -trimpath -o gosmb .
 go test -race ./...
 go vet ./...
 ```
@@ -237,14 +281,21 @@ To install for your user:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
-go build -trimpath -o "$HOME/.local/bin/gosmb" .
+CGO_ENABLED=0 go build -trimpath -o "$HOME/.local/bin/gosmb" .
 ```
 
-This is a separate application; it does not modify the original `go-shareenum`
-clone. It pins `go-smb v0.12.0`, which fixes the response-signature state and
-directory-offset issues found in the earlier v0.11.0 audit, and uses newer Go
-crypto/network dependencies. SMB signing is required for user sessions and
-encryption is preferred when supported; guest sessions have neither protection.
+`make` also produces the standalone executable. The SMB transport, NTLMv2,
+SPNEGO, DCE/RPC, and share-enumeration implementation lives in
+`internal/smbwire`; neither production code nor tests use a third-party SMB
+library. The remaining Go module dependencies provide terminal/OS support and
+the MD4 primitive required by NTLM; they are compiled into the executable.
+There is no Python, Samba, shared-library, or other runtime installation requirement.
+
+The client supports SMB 2.0.2, 2.1, 3.0, 3.0.2, and 3.1.1. It verifies user-session
+response signatures and prefers encryption when negotiated. SMB2 uses
+HMAC-SHA256; SMB3 uses AES-CMAC, with AES-128-CCM encryption for SMB 3.0/3.0.2
+and AES-128-GCM for SMB 3.1.1. SMB 3.1.1 also verifies preauthentication integrity
+through the derived session keys. Guest sessions have neither signing nor encryption.
 SMB1, Kerberos, interactive shells, relay mode, downloads, and
 uploads are not exposed.
 
@@ -254,8 +305,26 @@ and compare file contents/metadata before and after scans. Cases cover read-only
 write-allowed, write-only, unsupported/malformed metadata, denied credentials,
 server-side guest fallback, explicit guest access, single-attempt authentication,
 timeouts, cancellation, pagination, and CLI/output handling. The maximum-access
-parser also has a fuzz target. These checks do not replace testing against your
+parser and protocol decoders also have fuzz targets. Cryptographic primitives
+and NTLMv2 responses are checked against published known-answer vectors.
+These checks do not replace testing against your
 particular Windows/Samba/NAS implementation.
+
+`make test-interop` runs an optional independent Samba matrix in disposable
+Docker containers bound to localhost. It checks all five dialects, signing and
+encryption, guest identities, root permissions, large fragmented share lists,
+single-connection authentication, and unchanged share filesystem snapshots.
+See [the interoperability test instructions](tests/interop/README.md) for
+requirements, exact coverage, and JSON evidence output. Ordinary Go tests do
+not require Docker or Samba. Samba 4.22.10 returns the large list in one page;
+pagination is covered by local fixtures rather than this independent server.
+Windows and NAS interoperability remain untested unless separately verified in
+your environment.
+
+Known protocol limitation: SMB 3.0/3.0.2 negotiation does not perform signed
+`FSCTL_VALIDATE_NEGOTIATE_INFO`; those dialects lack negotiation-transcript
+validation. SMB 3.1.1 uses preauthentication integrity. SMB2 also lacks that
+transcript protection.
 
 Protocol references: [tree-connect maximum access](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/dd34e26c-a75e-47fa-aab2-6efc27502e96),
 [maximum-access response](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/0fe6be15-3a76-4032-9a44-56f846ac6244).

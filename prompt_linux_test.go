@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -42,7 +44,7 @@ type promptProcess struct {
 	terminal strings.Builder
 }
 
-func startPromptProcess(t *testing.T, target, username string) *promptProcess {
+func newPromptTerminal(t *testing.T) *promptProcess {
 	t.Helper()
 	master, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -77,6 +79,12 @@ func startPromptProcess(t *testing.T, target, username string) *promptProcess {
 	if p.before.Lflag&unix.ECHO == 0 {
 		t.Fatal("test terminal must initially echo input")
 	}
+	return p
+}
+
+func startPromptProcess(t *testing.T, target, username string) *promptProcess {
+	t.Helper()
+	p := newPromptTerminal(t)
 	p.cmd = exec.Command(os.Args[0], "-test.run=^TestPasswordPromptProcess$", "--", target,
 		"-u", username, "--no-progress", "--timeout=1s")
 	for _, value := range os.Environ() {
@@ -110,6 +118,51 @@ func startPromptProcess(t *testing.T, target, username string) *promptProcess {
 	}
 	t.Fatal("password prompt did not become ready")
 	return nil
+}
+
+type promptOutputFunc func([]byte) (int, error)
+
+func (f promptOutputFunc) Write(data []byte) (int, error) { return f(data) }
+
+func TestPasswordPromptOutputErrorsRestoreTerminalAndDiscardPassword(t *testing.T) {
+	for _, shortPrompt := range []bool{true, false} {
+		name := "newline_failure"
+		if shortPrompt {
+			name = "short_prompt"
+		}
+		t.Run(name, func(t *testing.T) {
+			terminal := newPromptTerminal(t)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			wantErr := io.ErrClosedPipe
+			if shortPrompt {
+				wantErr = io.ErrShortWrite
+			}
+			out := promptOutputFunc(func(data []byte) (int, error) {
+				if string(data) == "Password: " {
+					if shortPrompt {
+						return len(data) / 2, nil
+					}
+					if _, err := unix.Write(terminal.master, []byte("fixture-password\n")); err != nil {
+						return 0, err
+					}
+					return len(data), nil
+				}
+				if !shortPrompt {
+					return 0, io.ErrClosedPipe
+				}
+				return len(data), nil
+			})
+			password, err := promptPassword(ctx, terminal.slave, out)
+			if password != "" || !errors.Is(err, wantErr) {
+				t.Fatalf("prompt output failure was ignored: password length=%d error=%v", len(password), err)
+			}
+			after, err := unix.IoctlGetTermios(int(terminal.slave.Fd()), unix.TCGETS)
+			if err != nil || !reflect.DeepEqual(after, terminal.before) {
+				t.Fatalf("output failure did not restore terminal modes: error=%v", err)
+			}
+		})
+	}
 }
 
 func (p *promptProcess) readTerminal(t *testing.T, timeoutMS int) {
