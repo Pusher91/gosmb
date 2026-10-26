@@ -40,8 +40,12 @@ func scanTargets(ctx context.Context, targets []Target, opts Options, concurrenc
 	limit := min(max(concurrency, 1), len(targets))
 	workCtx, cancel := context.WithCancel(ctx)
 	var workers sync.WaitGroup
+	var timer *time.Timer
 	defer func() {
 		cancel()
+		if timer != nil {
+			timer.Stop()
+		}
 		workers.Wait()
 	}()
 	finished := make(chan hostScanOutcome, limit)
@@ -50,6 +54,11 @@ func scanTargets(ctx context.Context, targets []Target, opts Options, concurrenc
 	var outputErr error
 	stopping := false
 	ctxDone := ctx.Done()
+	stop := func() {
+		stopping = true
+		ctxDone = nil
+		cancel()
+	}
 	accept := func(outcome hostScanOutcome) {
 		active--
 		if !outcome.started {
@@ -58,17 +67,13 @@ func scanTargets(ctx context.Context, targets []Target, opts Options, concurrenc
 		if outputErr == nil {
 			outputErr = emit(outcome.result, outcome.completed)
 			if outputErr != nil {
-				stopping = true
-				ctxDone = nil
-				cancel()
+				stop()
 			}
 		}
 	}
 	for active > 0 || (!stopping && next < len(targets)) {
 		if ctx.Err() != nil && !stopping {
-			stopping = true
-			ctxDone = nil
-			cancel()
+			stop()
 		}
 		if stopping && active == 0 {
 			break
@@ -86,9 +91,7 @@ func scanTargets(ctx context.Context, targets []Target, opts Options, concurrenc
 			next++
 			active++
 			nextStart = time.Now().Add(delay)
-			workers.Add(1)
-			go func() {
-				defer workers.Done()
+			workers.Go(func() {
 				if workCtx.Err() != nil {
 					// A cancellation between dispatch and scheduling must not
 					// initiate another network connection or create a fake row.
@@ -96,26 +99,25 @@ func scanTargets(ctx context.Context, targets []Target, opts Options, concurrenc
 					return
 				}
 				finished <- runHostScan(workCtx, target, opts, scan)
-			}()
+			})
 			continue
 		}
-		var timer *time.Timer
 		var wake <-chan time.Time
 		if canStart {
-			timer = time.NewTimer(time.Until(nextStart))
+			// Reuse one delay timer even when completed hosts interrupt the wait.
+			if timer == nil {
+				timer = time.NewTimer(time.Until(nextStart))
+			} else {
+				timer.Reset(time.Until(nextStart))
+			}
 			wake = timer.C
 		}
 		select {
 		case outcome := <-finished:
 			accept(outcome)
 		case <-ctxDone:
-			stopping = true
-			ctxDone = nil
-			cancel()
+			stop()
 		case <-wake:
-		}
-		if timer != nil {
-			timer.Stop()
 		}
 	}
 	if outputErr != nil {

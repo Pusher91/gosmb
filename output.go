@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/rivo/uniseg"
 )
 
 // displayText escapes terminal controls before optional truncation. A negative
@@ -127,18 +130,36 @@ func tsvCell(value string) string {
 	return displayText(strings.ReplaceAll(value, `\`, `\\`), -1)
 }
 
-func writeTextResult(out io.Writer, r Result) error {
-	// Bound retained output independently of the host's share count. Reuse the
-	// buffer, and flush only between rows so each write contains whole records.
-	var b bytes.Buffer
-	flush := func() error {
-		n, err := out.Write(b.Bytes())
-		if err := outputWriteError(n, b.Len(), err); err != nil {
-			return err
-		}
-		b.Reset()
+// lineOutputBuffer bounds retained output independently of the share count.
+// Call endLine after each record: writes contain complete lines, even when one
+// line exceeds the batch threshold. The buffer is reused between batches.
+type lineOutputBuffer struct {
+	bytes.Buffer
+	out io.Writer
+}
+
+func (b *lineOutputBuffer) endLine() error {
+	b.WriteByte('\n')
+	if b.Len() >= 16<<10 {
+		return b.flush()
+	}
+	return nil
+}
+
+func (b *lineOutputBuffer) flush() error {
+	if b.Len() == 0 {
 		return nil
 	}
+	n, err := b.out.Write(b.Bytes())
+	if err := outputWriteError(n, b.Len(), err); err != nil {
+		return err
+	}
+	b.Reset()
+	return nil
+}
+
+func writeTextResult(out io.Writer, r Result) error {
+	b := lineOutputBuffer{out: out}
 	for fields := range textResultRows(r) {
 		for i, field := range fields {
 			if i > 0 {
@@ -146,17 +167,11 @@ func writeTextResult(out io.Writer, r Result) error {
 			}
 			b.WriteString(field)
 		}
-		b.WriteByte('\n')
-		if b.Len() >= 16<<10 {
-			if err := flush(); err != nil {
-				return err
-			}
+		if err := b.endLine(); err != nil {
+			return err
 		}
 	}
-	if b.Len() == 0 {
-		return nil
-	}
-	return flush()
+	return b.flush()
 }
 
 // Yield one row at a time so a host's entire escaped share list is not retained
@@ -183,7 +198,9 @@ func textResultRows(r Result) iter.Seq[[6]string] {
 		targetIP = net.JoinHostPort(targetIP, port)
 	}
 	guestFallback := "FALSE"
-	if r.GuestFallback {
+	if r.explicitGuest {
+		guestFallback = "N/A"
+	} else if r.GuestFallback {
 		guestFallback = "TRUE"
 	} else if r.TimedOut && !r.authenticationComplete {
 		switch r.Authentication {
@@ -216,36 +233,121 @@ func textResultRows(r Result) iter.Seq[[6]string] {
 	}
 }
 
-// Minimum widths let every host print immediately. The unbounded hostname
-// column comes last; no field is wrapped or truncated into extra result lines.
-var alignedWidths = [6]int{47, 32, 7, 7, 7, 0}
+// Fixed terminal-cell limits let each host print immediately without moving
+// later columns. Zero leaves only the final hostname column unbounded.
+var alignedWidths = [7]int{21, 20, 7, 7, 7, 18, 0}
 
 func writeAlignedHeader(out io.Writer) error {
-	return writeAlignedRow(out, [6]string{"TARGET_IP", "SHARE", "READ", "WRITE", "GUEST", "HOSTNAME"})
+	return writeAlignedRow(out, [7]string{"TARGET_IP", "SHARE", "READ", "WRITE", "GUEST", "STATUS", "HOSTNAME"}, false)
 }
 
-func writeAlignedResult(out io.Writer, result Result) error {
+func writeAlignedResult(out io.Writer, result Result, colored bool) error {
+	i := 0
 	for row := range textResultRows(result) {
-		if err := writeAlignedRow(out, row); err != nil {
+		var share *ShareResult
+		if i < len(result.Shares) {
+			share = &result.Shares[i]
+		}
+		fields := [7]string{row[0], row[1], row[2], row[3], row[4], tableStatus(result, share), row[5]}
+		if err := writeAlignedRow(out, fields, colored); err != nil {
 			return err
 		}
+		i++
 	}
 	return nil
 }
 
-func writeAlignedRow(out io.Writer, fields [6]string) error {
-	var padding [6]int
+// alignedCell clips already escaped text by terminal width, reserving room for
+// the ellipsis. Grapheme clusters and display escapes remain whole. TSV and
+// JSON deliberately retain complete values for machine consumers.
+func alignedCell(value string, limit int) (string, int) {
+	value = displayText(value, -1)
+	width := uniseg.StringWidth(value)
+	if limit == 0 || width <= limit {
+		return value, width
+	}
+	end, used, state := 0, 0, -1
+	for remaining := value; remaining != ""; {
+		var unit string
+		var unitWidth int
+		if n := displayEscapeLen(remaining); n > 0 {
+			unit, remaining, unitWidth, state = remaining[:n], remaining[n:], n, -1
+		} else {
+			unit, remaining, unitWidth, state = uniseg.FirstGraphemeClusterInString(remaining, state)
+		}
+		if used+unitWidth > limit-1 {
+			break
+		}
+		end += len(unit)
+		used += unitWidth
+	}
+	return value[:end] + "…", used + 1
+}
+
+// The input was escaped by tsvCell/displayText. Recognizing those tokens keeps
+// a clipped control character distinguishable from a partial escape sequence.
+func displayEscapeLen(value string) int {
+	if len(value) < 2 || value[0] != '\\' {
+		return 0
+	}
+	n := 0
+	switch value[1] {
+	case '\\', 'n', 'r', 't':
+		return 2
+	case 'x':
+		n = 4
+	case 'u':
+		n = 6
+	case 'U':
+		n = 10
+	default:
+		return 0
+	}
+	if len(value) < n {
+		return 0
+	}
+	for _, digit := range []byte(value[2:n]) {
+		if !(digit >= '0' && digit <= '9' || digit >= 'a' && digit <= 'f' || digit >= 'A' && digit <= 'F') {
+			return 0
+		}
+	}
+	return n
+}
+
+func writeAlignedRow(out io.Writer, fields [7]string, colored bool) error {
+	const reset = "\x1b[0m"
+	var padding [7]int
+	var colors [7]string
 	size := 1 // Final newline.
 	for i, value := range fields {
+		var width int
+		value, width = alignedCell(value, alignedWidths[i])
+		fields[i] = value
 		if i < len(fields)-1 {
-			padding[i] = max(0, alignedWidths[i]-utf8.RuneCountInString(value)) + 2
+			padding[i] = alignedWidths[i] - width + 2
 		}
 		size += len(value) + padding[i]
+		// Style only status columns, after measuring their visible widths.
+		if colored && i >= 2 && i <= 4 {
+			switch value {
+			case "TRUE":
+				colors[i] = "\x1b[32m"
+			case "FALSE":
+				colors[i] = "\x1b[31m"
+			}
+			if colors[i] != "" {
+				size += len(colors[i]) + len(reset)
+			}
+		}
 	}
 	var b strings.Builder
 	b.Grow(size)
 	for i, value := range fields {
+		b.WriteString(colors[i])
 		b.WriteString(value)
+		if colors[i] != "" {
+			b.WriteString(reset)
+		}
 		b.WriteString(strings.Repeat(" ", padding[i]))
 	}
 	b.WriteByte('\n')
@@ -253,26 +355,32 @@ func writeAlignedRow(out io.Writer, fields [6]string) error {
 	return err
 }
 
-// Status explanations go to stderr, leaving stdout as a stable TSV stream.
+// TSV status explanations go to stderr, leaving stdout as a stable data stream.
+// The interactive table presents these outcomes in its STATUS column instead.
 func writeTextDiagnostics(out io.Writer, r Result) error {
-	var b strings.Builder
+	b := lineOutputBuffer{out: out}
 	target := displayText(r.Target, 256)
 	if r.Error != "" {
-		fmt.Fprintf(&b, "gosmb: %s: %s\n", target, displayText(r.Error, 500))
+		fmt.Fprintf(&b, "gosmb: %s: %s", target, displayText(r.Error, 500))
+		if err := b.endLine(); err != nil {
+			return err
+		}
 	}
 	for _, s := range r.Shares {
 		if s.Error != "" {
-			fmt.Fprintf(&b, "gosmb: %s: %s: %s\n", target, displayText(s.Name, 256), displayText(s.Error, 500))
+			fmt.Fprintf(&b, "gosmb: %s: %s: %s", target, displayText(s.Name, 256), displayText(s.Error, 500))
+			if err := b.endLine(); err != nil {
+				return err
+			}
 		}
 	}
 	if len(r.Shares) == 0 && r.Enumeration == "ok" {
-		fmt.Fprintf(&b, "gosmb: %s: no shares returned\n", target)
+		fmt.Fprintf(&b, "gosmb: %s: no shares returned", target)
+		if err := b.endLine(); err != nil {
+			return err
+		}
 	}
-	if b.Len() == 0 {
-		return nil
-	}
-	_, err := writeOutputString(out, b.String())
-	return err
+	return b.flush()
 }
 
 func displayPermission(value string) string {
@@ -292,21 +400,42 @@ func displayPermission(value string) string {
 }
 
 func writeJSONResults(out io.Writer, results []Result) error {
-	if results == nil {
-		results = []Result{}
+	if len(results) == 0 {
+		_, err := writeOutputString(out, "[]\n")
+		return err
 	}
-	copied := false
+	// Encode one host at a time so a large scan does not need a second copy of
+	// the full report. The caller still decides when the complete array is sent.
+	buffered := bufio.NewWriterSize(checkedOutputWriter{out}, 16<<10)
+	var host bytes.Buffer
+	enc := json.NewEncoder(&host)
+	enc.SetIndent("  ", "  ")
+	var result Result
 	for i := range results {
-		if results[i].Shares == nil {
-			// Normalize the JSON shape without mutating the caller's results.
-			if !copied {
-				results = append([]Result(nil), results...)
-				copied = true
-			}
-			results[i].Shares = []ShareResult{}
+		result = results[i]
+		if result.Shares == nil {
+			// Normalize only the local copy, preserving caller-owned results.
+			result.Shares = []ShareResult{}
+		}
+		host.Reset()
+		if err := enc.Encode(&result); err != nil {
+			return err
+		}
+		prefix := "[\n  "
+		if i > 0 {
+			prefix = ",\n  "
+		}
+		if _, err := buffered.WriteString(prefix); err != nil {
+			return err
+		}
+		// Encode appends a newline. Array separators supply that newline after
+		// its comma, retaining the same indentation as encoding the full slice.
+		if _, err := buffered.Write(host.Bytes()[:host.Len()-1]); err != nil {
+			return err
 		}
 	}
-	enc := json.NewEncoder(checkedOutputWriter{out})
-	enc.SetIndent("", "  ")
-	return enc.Encode(results)
+	if _, err := buffered.WriteString("\n]\n"); err != nil {
+		return err
+	}
+	return buffered.Flush()
 }

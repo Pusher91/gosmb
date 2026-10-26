@@ -563,6 +563,39 @@ func TestEnumerationFollowsResumeCursorAndKeepsHiddenShares(t *testing.T) {
 	}
 }
 
+func TestEnumerationPreservesDistinctUnicodeShareNamesAcrossPages(t *testing.T) {
+	first := []Share{
+		{Name: "DATA", Comment: "first ASCII spelling"},
+		{Name: "İ", Comment: "capital dotted I"},
+		{Name: "K", Comment: "Kelvin sign"},
+		{Name: "Équipe", Comment: "exact Unicode repeat"},
+		{Name: "Docs資料", Comment: "ASCII case within a Unicode name"},
+	}
+	second := []Share{
+		{Name: "data", Type: 3, Comment: "duplicate must not replace the first entry"},
+		{Name: "i", Comment: "ASCII i is distinct from dotted I"},
+		{Name: "K", Comment: "ASCII K is distinct from the Kelvin sign"},
+		{Name: "İ"}, {Name: "K"}, {Name: "Équipe"}, {Name: "docs資料"},
+	}
+	calls := 0
+	shares, err := enumeratePages("fixture", func([]byte) ([]byte, error) {
+		calls++
+		switch calls {
+		case 1:
+			return rpcFixturePage(first, 234, 42), nil
+		case 2:
+			return rpcFixturePage(second, 0, 0), nil
+		default:
+			t.Fatal("enumeration continued after the final page")
+			return nil, nil
+		}
+	})
+	want := append(append([]Share(nil), first...), second[1], second[2])
+	if err != nil || calls != 2 || !reflect.DeepEqual(shares, want) {
+		t.Fatalf("Unicode share identity or first-entry retention changed: got=%+v want=%+v calls=%d err=%v", shares, want, calls, err)
+	}
+}
+
 func TestEnumerationStopsOnRepeatedCursor(t *testing.T) {
 	calls := 0
 	shares, err := enumeratePages("fixture", func([]byte) ([]byte, error) {

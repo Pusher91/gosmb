@@ -292,7 +292,7 @@ func enumeratePages(host string, call func([]byte) ([]byte, error)) ([]Share, er
 			return shares, fmt.Errorf("NetShareEnum returned Windows status %d", decoded.status)
 		}
 		for _, share := range decoded.shares {
-			key := strings.ToLower(share.Name)
+			key := shareNameKey(share.Name)
 			if seen[key] {
 				continue
 			}
@@ -318,6 +318,19 @@ func enumeratePages(host string, call func([]byte) ([]byte, error)) ([]Share, er
 		binary.LittleEndian.PutUint32(body[len(body)-4:], decoded.resume)
 	}
 	return shares, errors.New("share enumeration exceeded 256-page safety limit")
+}
+
+// MS-SRVS 3.1.4.34 leaves case-insensitive comparison implementation-specific.
+// Fold only ASCII case so local Unicode mappings cannot hide distinct names
+// reported by the server. Exact non-ASCII repeats still share a key.
+// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-srvs/073d1b6c-d608-4778-ac5f-6240eda83b34
+func shareNameKey(name string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, name)
 }
 
 func encodeShareRequest(host string, resume uint32) ([]byte, error) {

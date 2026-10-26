@@ -1,13 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -49,6 +46,8 @@ Columns:
   READ       Root listing permission
   WRITE      Permission to add files at root (metadata only; no write test)
   GUEST      TRUE when supplied credentials are accepted as Guest
+             N/A when --guest is used
+  STATUS     Scan outcome in the interactive table only; codes below
   HOSTNAME   Supplied hostname; - for literal IP targets (no reverse DNS)
 
 READ/WRITE statuses (text output):
@@ -57,6 +56,37 @@ READ/WRITE statuses (text output):
   UNKNOWN  Permission metadata missing/unsupported, or connection/login/access check failed
   TIMEOUT  Check timed out
   N/A      Not applicable (non-disk share)
+
+STATUS codes (interactive table):
+  OK                  Check completed; READ/WRITE show the permissions
+  NO_SHARES           Share enumeration completed but returned no shares
+  DNS_FAILED          Hostname lookup failed
+  CONNECT_FAILED      Could not establish a TCP connection
+  CONNECT_REFUSED     TCP connection was refused
+  CONNECT_TIMEOUT     TCP connection timed out
+  NEGOTIATE_FAILED    Server rejected SMB negotiation
+  SMB_FAILED          SMB connection or protocol exchange failed
+  SMB_TIMEOUT         SMB negotiation or session setup timed out
+  AUTH_FAILED         Server rejected the login
+  ACCOUNT_LOCKED      Account is locked out
+  ACCOUNT_DISABLED    Account is disabled
+  ACCOUNT_EXPIRED     Account has expired
+  ACCOUNT_RESTRICTED  Account restrictions prevented logon
+  PASSWORD_EXPIRED    Password has expired
+  PASSWORD_CHANGE     Password must be changed before logon
+  LOGON_HOURS         Logon is not allowed at this time
+  WORKSTATION_DENIED  Logon is not allowed from this workstation
+  AUTH_UNVERIFIED     Session was anonymous or its identity could not be verified
+  GUEST_MISMATCH      Server did not establish a Guest session for --guest
+  ENUM_DENIED         Access to the share list was denied
+  ENUM_FAILED         Could not retrieve the share list
+  ENUM_PARTIAL        Share list is incomplete; discovered shares are shown
+  ENUM_TIMEOUT        Retrieving the share list timed out
+  CHECK_FAILED        Permission check failed or required metadata was unavailable
+  CHECK_TIMEOUT       Share permission check timed out
+  CLEANUP_FAILED      Closing a handle, share connection, or session failed
+  CLEANUP_TIMEOUT     Closing a handle, share connection, or session timed out
+  CANCELED            Scan was canceled
 `
 
 type cliConfig struct {
@@ -78,17 +108,28 @@ type cliDependencies struct {
 	stderr           io.Writer
 	stdoutIsTerminal bool
 	stderrIsTerminal bool
+	enableColor      func() (restore func(), enabled bool)
 	lookupEnv        func(string) (string, bool)
 	prompt           func(context.Context, io.Reader, io.Writer) (string, error)
 	scan             func(context.Context, Target, Options) Result
 }
 
-func cliOptionTakesValue(name string) bool {
+// Normalize aliases once so help lookahead and argument parsing interpret the
+// same option names and never mistake an alias's value for a help request.
+func canonicalCLIOption(name string) (canonical string, takesValue bool) {
 	switch name {
-	case "-u", "--user", "--username", "-p", "--pass", "--password", "-d", "--domain", "--timeout", "--host-timeout", "--concurrency", "--delay":
-		return true
+	case "-h", "--help":
+		return "--help", false
+	case "-u", "--user", "--username":
+		return "--user", true
+	case "-p", "--pass", "--password":
+		return "--password", true
+	case "-d", "--domain":
+		return "--domain", true
+	case "--timeout", "--host-timeout", "--concurrency", "--delay":
+		return name, true
 	}
-	return false
+	return name, false
 }
 
 // Help takes precedence over validation, but an option value such as a password
@@ -102,11 +143,12 @@ func helpRequested(args []string) bool {
 		if arg == "--" {
 			break
 		}
-		if arg == "-h" || arg == "--help" {
+		name, _, hasValue := strings.Cut(arg, "=")
+		name, takesValue := canonicalCLIOption(name)
+		if name == "--help" && !hasValue {
 			return true
 		}
-		name, _, hasValue := strings.Cut(arg, "=")
-		if cliOptionTakesValue(name) && !hasValue {
+		if takesValue && !hasValue {
 			i++
 		}
 	}
@@ -138,44 +180,33 @@ func parseCLI(ctx context.Context, args []string) (cliConfig, error) {
 			continue
 		}
 		name, value, hasValue := strings.Cut(arg, "=")
+		name, takesValue := canonicalCLIOption(name)
+		var toggle *bool
 		switch name {
-		case "-h", "--help":
+		case "--help":
 			// Bare help flags returned above; only valued forms reach this case.
 			return cfg, errors.New("help does not accept a value")
 		case "--json":
-			if hasValue {
-				return cfg, errors.New("json does not accept a value")
-			}
-			cfg.json = true
-			continue
+			toggle = &cfg.json
 		case "--tsv":
-			if hasValue {
-				return cfg, errors.New("tsv does not accept a value")
-			}
-			cfg.tsv = true
-			continue
+			toggle = &cfg.tsv
 		case "--no-header":
-			if hasValue {
-				return cfg, errors.New("no-header does not accept a value")
-			}
-			cfg.noHeader = true
-			continue
+			toggle = &cfg.noHeader
 		case "--no-progress":
-			if hasValue {
-				return cfg, errors.New("no-progress does not accept a value")
-			}
-			cfg.noProgress = true
-			continue
+			toggle = &cfg.noProgress
 		case "--guest":
-			if hasValue {
-				return cfg, errors.New("guest does not accept a value")
-			}
-			cfg.options.Guest = true
-			continue
+			toggle = &cfg.options.Guest
 		default:
-			if !cliOptionTakesValue(name) {
+			if !takesValue {
 				return cfg, errors.New("unknown option; use --help for supported options")
 			}
+		}
+		if toggle != nil {
+			if hasValue {
+				return cfg, fmt.Errorf("%s does not accept a value", strings.TrimPrefix(name, "--"))
+			}
+			*toggle = true
+			continue
 		}
 		if !hasValue {
 			if i+1 >= len(args) {
@@ -185,13 +216,13 @@ func parseCLI(ctx context.Context, args []string) (cliConfig, error) {
 			value = args[i]
 		}
 		switch name {
-		case "-u", "--user", "--username":
+		case "--user":
 			credentialsSet = true
 			cfg.options.Username = value
-		case "-p", "--pass", "--password":
+		case "--password":
 			credentialsSet = true
 			cfg.options.Password, cfg.passwordSet = value, true
-		case "-d", "--domain":
+		case "--domain":
 			credentialsSet = true
 			cfg.options.Domain = value
 		case "--timeout":
@@ -306,165 +337,6 @@ func parseIdentity(user, domain string) (string, string, error) {
 	return user, domain, nil
 }
 
-func parsePort(value string) (int, error) {
-	if value == "" || strings.IndexFunc(value, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
-		return 0, errors.New("invalid port")
-	}
-	n, err := strconv.Atoi(value)
-	if err != nil || n < 1 || n > 65535 {
-		return 0, errors.New("invalid port")
-	}
-	return n, nil
-}
-
-func parseTarget(raw string) (Target, error) {
-	bad := errors.New("invalid target: use a hostname, IP address, or host:port (bracket IPv6 with a port)")
-	if raw == "" || !utf8.ValidString(raw) || strings.ContainsAny(raw, `/\?#@`) || strings.ContainsFunc(raw, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
-		return Target{}, bad
-	}
-	host, port := raw, 445
-	if strings.HasPrefix(raw, "[") {
-		if strings.HasSuffix(raw, "]") {
-			host = raw[1 : len(raw)-1]
-		} else {
-			var portString string
-			var err error
-			host, portString, err = net.SplitHostPort(raw)
-			if err != nil {
-				return Target{}, bad
-			}
-			port, err = parsePort(portString)
-			if err != nil {
-				return Target{}, bad
-			}
-		}
-		addr, err := netip.ParseAddr(host)
-		if err != nil || !addr.Is6() {
-			return Target{}, bad
-		}
-		host = addr.String()
-	} else if addr, err := netip.ParseAddr(raw); err == nil {
-		host = addr.String()
-	} else if strings.Contains(raw, ":") {
-		var portString string
-		var err error
-		host, portString, err = net.SplitHostPort(raw)
-		if err != nil {
-			return Target{}, bad
-		}
-		port, err = parsePort(portString)
-		if err != nil {
-			return Target{}, bad
-		}
-	}
-	if addr, err := netip.ParseAddr(host); err == nil {
-		if zone := addr.Zone(); zone != "" && strings.IndexFunc(zone, func(r rune) bool {
-			return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_.-", r))
-		}) >= 0 {
-			return Target{}, bad
-		}
-		host = addr.String()
-	} else {
-		// A final dot is the DNS root label: retain it in the target so an
-		// absolute name cannot become subject to resolver search suffixes.
-		labels := strings.TrimSuffix(host, ".")
-		if len(labels) == 0 || len(labels) > 253 || strings.Contains(labels, ":") {
-			return Target{}, bad
-		}
-		if strings.Contains(labels, ".") && strings.IndexFunc(labels, func(r rune) bool { return r != '.' && (r < '0' || r > '9') }) == -1 {
-			return Target{}, bad
-		}
-		for _, label := range strings.Split(labels, ".") {
-			if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-				return Target{}, bad
-			}
-			for _, r := range label {
-				if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-') {
-					return Target{}, bad
-				}
-			}
-		}
-	}
-	return Target{Host: host, Port: port}, nil
-}
-
-func readTargets(ctx context.Context, path string) ([]Target, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, "//") || strings.Contains(path, "://") {
-		return nil, errors.New("host-list file must be a local path, not a URL or UNC path")
-	}
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() {
-		return nil, errors.New("host-list path must be a readable regular file")
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, errors.New("cannot open host-list file")
-	}
-	defer f.Close()
-	info, err = f.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return nil, errors.New("host-list path must be a readable regular file")
-	}
-	return parseTargetList(ctx, f)
-}
-
-func parseTargetList(ctx context.Context, r io.Reader) ([]Target, error) {
-	var targets []Target
-	var seen map[Target]struct{}
-	scanner := bufio.NewScanner(r)
-	lineNumber := 0
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if !scanner.Scan() {
-			break
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		lineNumber++
-		line := scanner.Text()
-		if lineNumber == 1 {
-			line = strings.TrimPrefix(line, "\ufeff")
-		}
-		if !utf8.ValidString(line) {
-			return nil, fmt.Errorf("host-list line %d is not valid UTF-8", lineNumber)
-		}
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		expanded, err := parseTargetSpec(line)
-		if err != nil {
-			return nil, fmt.Errorf("invalid target at host-list line %d: %w", lineNumber, err)
-		}
-		if seen == nil {
-			// The first bounded expansion gives an exact initial capacity;
-			// a large CIDR need not repeatedly grow both collections.
-			seen = make(map[Target]struct{}, len(expanded))
-			targets = make([]Target, 0, len(expanded))
-		}
-		targets, err = appendUniqueTargets(targets, seen, expanded)
-		if err != nil {
-			return nil, fmt.Errorf("host-list line %d: %w", lineNumber, err)
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if scanner.Err() != nil {
-		return nil, errors.New("cannot read host-list file (read error or line too long)")
-	}
-	if len(targets) == 0 {
-		return nil, errors.New("host-list file contains no targets")
-	}
-	return targets, nil
-}
-
 func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int) {
 	cfg, err := parseCLI(ctx, args)
 	if err != nil {
@@ -502,11 +374,38 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 			return 2
 		}
 	}
+	if ctx.Err() != nil {
+		fmt.Fprintln(deps.stderr, "gosmb: canceled")
+		return 1
+	}
+	if !utf8.ValidString(cfg.options.Password) {
+		fmt.Fprintln(deps.stderr, "gosmb: password must be valid UTF-8")
+		return 2
+	}
 	var results []Result
 	if cfg.json {
 		results = make([]Result, 0, len(cfg.targets))
 	}
 	aligned := deps.stdoutIsTerminal && !cfg.tsv && !cfg.json
+	colored := aligned && deps.enableColor != nil
+	if colored && deps.lookupEnv != nil {
+		noColor, _ := deps.lookupEnv("NO_COLOR")
+		terminal, _ := deps.lookupEnv("TERM")
+		colored = noColor == "" && terminal != "dumb"
+	}
+	if colored {
+		var restore func()
+		restore, colored = deps.enableColor()
+		if restore != nil {
+			defer restore()
+		}
+	}
+	writeResult := writeTextResult
+	if aligned {
+		writeResult = func(out io.Writer, result Result) error {
+			return writeAlignedResult(out, result, colored)
+		}
+	}
 	if !cfg.json && !cfg.noHeader {
 		writeHeader := writeTextHeader
 		if aligned {
@@ -520,7 +419,7 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 	completed := 0
 	progress := newProgress(deps.stderr, deps.stderrIsTerminal && !cfg.noProgress, len(cfg.targets))
 	defer func() {
-		if err := progress.Finish(completed, ctx.Err() != nil); err != nil {
+		if err := progress.Finish(completed, ctx.Err() != nil); err != nil || ctx.Err() != nil {
 			code = 1
 		}
 	}()
@@ -528,6 +427,7 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 		return 1
 	}
 	scanErr := scanTargets(ctx, cfg.targets, cfg.options, cfg.concurrency, cfg.delay, deps.scan, func(result Result, hostCompleted bool) error {
+		result.explicitGuest = cfg.options.Guest
 		if hostCompleted {
 			completed++
 		} else {
@@ -547,16 +447,14 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 		if cfg.json {
 			results = append(results, result)
 		} else {
-			writeResult := writeTextResult
-			if aligned {
-				writeResult = writeAlignedResult
-			}
 			if err := writeResult(deps.stdout, result); err != nil {
 				fmt.Fprintln(deps.stderr, "gosmb: could not write output")
 				return err
 			}
-			if err := writeTextDiagnostics(deps.stderr, result); err != nil {
-				return err
+			if !aligned {
+				if err := writeTextDiagnostics(deps.stderr, result); err != nil {
+					return err
+				}
 			}
 		}
 		return progress.Update(completed)

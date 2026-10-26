@@ -42,10 +42,19 @@ type Result struct {
 	TimedOut       bool          `json:"timed_out,omitempty"`
 	Error          string        `json:"error,omitempty"`
 
+	// Explicit guest mode makes credential fallback inapplicable in text output,
+	// including when the connection or authentication never completes.
+	explicitGuest bool
+
 	// A later timeout must not replace a result already obtained from the
 	// server, including an error unrelated to the timeout.
 	authenticationComplete bool
 	enumerationComplete    bool
+
+	// Interactive-table outcomes are recorded at the failing operation. They
+	// deliberately stay separate from public diagnostics and serialized data.
+	status        scanStatus
+	cleanupStatus scanStatus
 }
 
 type ShareResult struct {
@@ -61,4 +70,5 @@ type ShareResult struct {
 	// A completed probe may legitimately have UNKNOWN metadata. Keep that
 	// distinct from an unanswered probe when the host's deadline expires.
 	probeComplete bool
+	status        scanStatus
 }

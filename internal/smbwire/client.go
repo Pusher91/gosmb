@@ -8,11 +8,13 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha512"
+	"encoding/asn1"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"unicode/utf16"
@@ -37,18 +39,22 @@ const (
 	AuthResultGuest                 = 1
 	AuthResultAnonymous             = 2
 	AuthResultUnverified            = 3
-	maxFrame                        = 16 << 20
-	statusPending            uint32 = 0x103
-	statusMoreProcessing     uint32 = 0xc0000016
-	statusBufferOverflow     uint32 = 0x80000005
+	// SessionSetupCommand identifies authentication status responses.
+	SessionSetupCommand  uint16 = 1
+	maxFrame                    = 16 << 20
+	statusPending        uint32 = 0x103
+	statusMoreProcessing uint32 = 0xc0000016
+	statusBufferOverflow uint32 = 0x80000005
 )
 
 type NTStatusError struct {
-	Op     string
 	Status uint32
+	// Command identifies the request which received this status. The same
+	// status code can mean different things before or after authentication.
+	Command uint16
 }
 
-func (e *NTStatusError) Error() string { return fmt.Sprintf("%s: SMB status 0x%08x", e.Op, e.Status) }
+func (e *NTStatusError) Error() string { return fmt.Sprintf("request: SMB status 0x%08x", e.Status) }
 
 type Options struct {
 	Host                       string
@@ -75,6 +81,9 @@ type Connection struct {
 	credits                                       uint32
 	dialect                                       uint16
 	preauth                                       [64]byte
+	clientNegotiateInfo                           []byte
+	serverNegotiateInfo                           [24]byte
+	negotiationChecked                            bool
 	key, signingKey, encryptionKey, decryptionKey []byte
 	sessionFlags                                  uint16
 	authenticated, encryptionAvailable            bool
@@ -193,10 +202,10 @@ func (c *Connection) exchange(command uint16, treeID uint32, body []byte) (resul
 	id := c.messageID
 	c.messageID++
 	c.credits--
-	if command == 0 || (command == 1 && c.dialect == 0x311) {
+	if command == 0 || (command == SessionSetupCommand && c.dialect == 0x311) {
 		c.hashPacket(packet)
 	}
-	if command == 1 && len(c.key) != 0 {
+	if command == SessionSetupCommand && len(c.key) != 0 {
 		var err error
 		c.signingKey, c.encryptionKey, c.decryptionKey, err = deriveKeys(c.dialect, c.key, c.preauth[:])
 		if err != nil {
@@ -205,7 +214,9 @@ func (c *Connection) exchange(command uint16, treeID uint32, body []byte) (resul
 	}
 	secure := c.authenticated && c.sessionFlags&3 == 0
 	encrypted := secure && c.encryptionAvailable
-	if secure && !encrypted {
+	// Secure negotiation requires an explicit signature even when the
+	// request is also protected by the session's encryption policy.
+	if secure && (!encrypted || command == smb2IOCTL) {
 		binary.LittleEndian.PutUint32(packet[16:], 8)
 		sig, err := signSMB(c.dialect, c.signingKey, packet)
 		if err != nil {
@@ -248,7 +259,7 @@ func (c *Connection) exchange(command uint16, treeID uint32, body []byte) (resul
 		if flags&1 == 0 || binary.LittleEndian.Uint32(response[20:]) != 0 || binary.LittleEndian.Uint16(response[12:]) != command || binary.LittleEndian.Uint64(response[24:]) != id {
 			return nil, errors.New("mismatched SMB response")
 		}
-		if command != 0 && command != 1 && binary.LittleEndian.Uint64(response[40:]) != c.sessionID {
+		if command != 0 && command != SessionSetupCommand && binary.LittleEndian.Uint64(response[40:]) != c.sessionID {
 			return nil, errors.New("mismatched SMB session")
 		}
 		status := binary.LittleEndian.Uint32(response[8:])
@@ -263,7 +274,7 @@ func (c *Connection) exchange(command uint16, treeID uint32, body []byte) (resul
 			asyncID = got
 		} else if asyncID != 0 {
 			return nil, errors.New("SMB asynchronous response lost its identifier")
-		} else if command != 0 && command != 1 && command != 3 && binary.LittleEndian.Uint32(response[36:]) != treeID {
+		} else if command != 0 && command != SessionSetupCommand && command != 3 && binary.LittleEndian.Uint32(response[36:]) != treeID {
 			return nil, errors.New("mismatched SMB tree")
 		}
 		// Interim pending responses are explicitly unsigned in MS-SMB2. They
@@ -273,7 +284,7 @@ func (c *Connection) exchange(command uint16, treeID uint32, body []byte) (resul
 				return nil, err
 			}
 		}
-		failed := status != 0 && !(command == 1 && status == statusMoreProcessing) && !(command == 8 && status == statusBufferOverflow)
+		failed := status != 0 && !(command == SessionSetupCommand && status == statusMoreProcessing) && !(command == 8 && status == statusBufferOverflow)
 		if failed && !validErrorResponse(response, c.dialect) {
 			return nil, errors.New("invalid SMB error response")
 		}
@@ -287,11 +298,11 @@ func (c *Connection) exchange(command uint16, treeID uint32, body []byte) (resul
 			}
 			continue
 		}
-		if command == 0 || (command == 1 && c.dialect == 0x311 && status == statusMoreProcessing) {
+		if command == 0 || (command == SessionSetupCommand && c.dialect == 0x311 && status == statusMoreProcessing) {
 			c.hashPacket(response)
 		}
 		if failed {
-			return nil, &NTStatusError{Op: "request", Status: status}
+			return nil, &NTStatusError{Status: status, Command: command}
 		}
 		return response, nil
 	}
@@ -376,9 +387,10 @@ func readFrame(r io.Reader) ([]byte, error) {
 }
 
 func (c *Connection) negotiate() error {
-	body := make([]byte, 48)
+	dialects := [...]uint16{0x202, 0x210, 0x300, 0x302, 0x311}
+	body := make([]byte, (36+2*len(dialects)+7)&^7)
 	binary.LittleEndian.PutUint16(body, 36)
-	binary.LittleEndian.PutUint16(body[2:], 5)
+	binary.LittleEndian.PutUint16(body[2:], uint16(len(dialects)))
 	// Request signing and verify every user response. A server-reported Guest
 	// session is a separately reported, deliberately unsigned identity.
 	binary.LittleEndian.PutUint16(body[4:], 3)
@@ -386,11 +398,18 @@ func (c *Connection) negotiate() error {
 	if _, err := rand.Read(body[12:28]); err != nil {
 		return err
 	}
-	binary.LittleEndian.PutUint32(body[28:], 112)
+	binary.LittleEndian.PutUint32(body[28:], uint32(64+len(body)))
 	binary.LittleEndian.PutUint16(body[32:], 3)
-	for i, d := range []uint16{0x202, 0x210, 0x300, 0x302, 0x311} {
+	for i, d := range dialects {
 		binary.LittleEndian.PutUint16(body[36+i*2:], d)
 	}
+	// Retain an independent copy of the exact offer for secure negotiation.
+	// Its layout is VALIDATE_NEGOTIATE_INFO, not the NEGOTIATE wire body.
+	c.clientNegotiateInfo = make([]byte, 24+2*len(dialects))
+	copy(c.clientNegotiateInfo[:20], body[8:28])
+	copy(c.clientNegotiateInfo[20:22], body[4:6])
+	copy(c.clientNegotiateInfo[22:24], body[2:4])
+	copy(c.clientNegotiateInfo[24:], body[36:36+2*len(dialects)])
 	preauth := make([]byte, 38)
 	binary.LittleEndian.PutUint16(preauth, 1)
 	binary.LittleEndian.PutUint16(preauth[2:], 32)
@@ -419,14 +438,15 @@ func (c *Connection) negotiate() error {
 		return errors.New("invalid SMB negotiate response")
 	}
 	c.dialect = binary.LittleEndian.Uint16(r[68:])
-	switch c.dialect {
-	case 0x202, 0x210, 0x300, 0x302, 0x311:
-	default:
+	if !slices.Contains(dialects[:], c.dialect) {
 		return errors.New("server selected an unoffered SMB dialect")
 	}
 	if binary.LittleEndian.Uint16(r[66:])&1 == 0 {
 		return errors.New("server does not support SMB signing")
 	}
+	copy(c.serverNegotiateInfo[:4], r[88:92])
+	copy(c.serverNegotiateInfo[4:20], r[72:88])
+	copy(c.serverNegotiateInfo[20:24], r[66:70])
 	if _, err = boundedField(r, uint64(binary.LittleEndian.Uint16(r[120:])), uint64(binary.LittleEndian.Uint16(r[122:])), 128); err != nil {
 		return err
 	}
@@ -500,7 +520,7 @@ func (c *Connection) negotiate() error {
 func (c *Connection) authenticate() error {
 	neg := ntlmNegotiate()
 	first := spnegoInitial(neg)
-	r, err := c.exchange(1, 0, sessionSetupBody(first))
+	r, err := c.exchange(SessionSetupCommand, 0, sessionSetupBody(first))
 	if err != nil {
 		return err
 	}
@@ -518,9 +538,14 @@ func (c *Connection) authenticate() error {
 	if err != nil {
 		return err
 	}
-	_, challenge, _, err := parseSPNEGOResponse(blob)
+	initialState, challenge, _, err := parseSPNEGOResponse(blob)
 	if err != nil {
 		return err
+	}
+	// RFC 4178 4.2.2: accept-completed is terminal. A challenge cannot
+	// request another NTLM token after SPNEGO has completed.
+	if initialState == 0 {
+		return errors.New("server completed SPNEGO authentication before NTLM authentication")
 	}
 	auth, key, err := ntlmAuthenticate(neg, challenge, c.opts.Username, c.opts.Password, c.opts.Domain, c.opts.Host, c.opts.Guest)
 	if err != nil {
@@ -536,7 +561,7 @@ func (c *Connection) authenticate() error {
 	if len(token) > 65535 {
 		return errors.New("NTLM authentication token exceeds SMB size limit")
 	}
-	r, err = c.exchange(1, 0, sessionSetupBody(token))
+	r, err = c.exchange(SessionSetupCommand, 0, sessionSetupBody(token))
 	if err != nil {
 		return err
 	}
@@ -581,6 +606,11 @@ func (c *Connection) authenticate() error {
 		}
 		if c.sessionFlags&4 != 0 && !c.encryptionAvailable {
 			return errors.New("server requires unavailable SMB encryption")
+		}
+		// RFC 4178 3.1 and 5(c)(I): request-mic requires the exchange in
+		// both directions, including the acceptor's final mechanism-list MIC.
+		if initialState == 3 && len(serverMIC) == 0 {
+			return errors.New("server omitted the required SPNEGO mechanism-list MIC")
 		}
 		if len(serverMIC) != 0 {
 			if err := ntlmVerifyMechListMIC(auth, key, mechList, serverMIC); err != nil {
@@ -659,6 +689,9 @@ func (c *Connection) TreeConnect(name string) error {
 	}
 	if t.flags&0x8000 != 0 && (!c.encryptionAvailable || c.sessionFlags&3 != 0) {
 		return errors.New("share requires unavailable encryption")
+	}
+	if err := c.validateNegotiateInfo(t.id); err != nil {
+		return err
 	}
 	c.trees[name] = t
 	return nil
@@ -859,9 +892,12 @@ func (f *File) Read(maximum int) ([]byte, error) {
 }
 
 func der(tag byte, parts ...[]byte) []byte {
-	body := bytes.Join(parts, nil)
-	b := []byte{tag}
-	n := len(body)
+	n := 0
+	for _, part := range parts {
+		n += len(part)
+	}
+	b := make([]byte, 0, n+4)
+	b = append(b, tag)
 	if n < 128 {
 		b = append(b, byte(n))
 	} else if n < 256 {
@@ -869,7 +905,10 @@ func der(tag byte, parts ...[]byte) []byte {
 	} else {
 		b = append(b, 0x82, byte(n>>8), byte(n))
 	}
-	return append(b, body...)
+	for _, part := range parts {
+		b = append(b, part...)
+	}
+	return b
 }
 func spnegoInitial(token []byte) []byte {
 	return der(0x60, []byte{6, 6, 0x2b, 6, 1, 5, 5, 2}, der(0xa0, der(0x30, der(0xa0, ntlmMechList()), der(0xa2, der(4, token)))))
@@ -911,13 +950,25 @@ func parseSPNEGOResponse(blob []byte) (state int, token, mic []byte, err error) 
 	if err != nil || len(rest) != 0 {
 		return state, nil, nil, errors.New("invalid SPNEGO response sequence")
 	}
-	seen := map[byte]bool{}
+	var seen [4]bool
 	for len(fields) > 0 {
 		tag := fields[0]
-		if tag < 0xa0 || tag > 0xa3 || seen[tag] {
-			return state, nil, nil, errors.New("duplicate or unknown SPNEGO response field")
+		if tag < 0xa0 || tag > 0xa3 {
+			// RFC 4178 6 requires unknown extension fields to be ignored.
+			// RawValue bounds the complete explicit field, including high
+			// tag numbers, without interpreting its opaque contents.
+			var extension asn1.RawValue
+			rest, e := asn1.Unmarshal(fields, &extension)
+			if e != nil || extension.Class != asn1.ClassContextSpecific || !extension.IsCompound || extension.Tag <= 3 {
+				return state, nil, nil, errors.New("invalid SPNEGO extension field")
+			}
+			fields = rest
+			continue
 		}
-		seen[tag] = true
+		if seen[tag-0xa0] {
+			return state, nil, nil, errors.New("duplicate SPNEGO response field")
+		}
+		seen[tag-0xa0] = true
 		var field []byte
 		field, fields, err = derValue(fields, tag)
 		if err != nil {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"runtime"
 
 	"golang.org/x/term"
 )
@@ -40,39 +41,33 @@ func promptPassword(ctx context.Context, in io.Reader, out io.Writer) (password 
 	if _, err := writeOutputString(out, "Password: "); err != nil {
 		return "", err
 	}
-	reader := &passwordInput{ctx: ctx, in: f}
-	password, err = readPromptLine(reader)
-	if err != nil {
-		return "", err
-	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	return password, nil
+	return readPassword(ctx, f)
 }
 
 // The terminal performs line editing. Read one byte at a time to preserve
 // literal password bytes (including tabs) without consuming the next line.
-func readPromptLine(in io.Reader) (string, error) {
+func readPromptLine(ctx context.Context, in io.Reader) (string, error) {
 	var password []byte
 	var buf [1]byte
 	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		n, err := in.Read(buf[:])
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		if err != nil && !errors.Is(err, io.EOF) {
 			// Report input failures even when the same read completes the line.
 			return "", err
 		}
 		if n > 0 {
-			switch buf[0] {
-			case '\r', '\n':
+			// Unix canonical mode already maps Enter to LF; a remaining CR
+			// was quoted and belongs to the password. Windows uses CRLF.
+			if buf[0] == '\n' || (buf[0] == '\r' && runtime.GOOS == "windows") {
 				return string(password), nil
-			case '\b':
-				if len(password) > 0 {
-					password = password[:len(password)-1]
-				}
-			default:
-				password = append(password, buf[0])
 			}
+			password = append(password, buf[0])
 		}
 		if err != nil {
 			if len(password) > 0 {
@@ -83,35 +78,29 @@ func readPromptLine(in io.Reader) (string, error) {
 	}
 }
 
-type passwordInput struct {
-	ctx context.Context
-	in  io.Reader
-}
-
-func (r *passwordInput) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
+func readPassword(ctx context.Context, in io.Reader) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	type readResult struct {
-		data []byte
-		err  error
+		password string
+		err      error
 	}
 	ready := make(chan readResult, 1)
 	go func() {
-		// Own the buffer so cancellation cannot leave a read modifying the
-		// caller's memory. At most one stdin read can remain blocked until main
-		// exits on cancellation; it never writes output or changes terminal modes.
-		buf := make([]byte, len(p))
-		n, err := r.in.Read(buf)
-		ready <- readResult{buf[:n], err}
+		// One goroutine owns the complete password buffer. Cancellation can
+		// leave at most one byte read blocked until main exits; the loop checks
+		// the context before reading again. It never changes terminal modes.
+		password, err := readPromptLine(ctx, in)
+		ready <- readResult{password, err}
 	}()
 	select {
-	case <-r.ctx.Done():
-		return 0, r.ctx.Err()
+	case <-ctx.Done():
+		return "", ctx.Err()
 	case result := <-ready:
-		if err := r.ctx.Err(); err != nil {
-			return 0, err
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
-		return copy(p, result.data), result.err
+		return result.password, result.err
 	}
 }

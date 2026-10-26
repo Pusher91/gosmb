@@ -12,8 +12,74 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
+
+func TestSchedulerDelayAfterCompletedWorkers(t *testing.T) {
+	for _, interrupted := range []bool{false, true} {
+		name := "complete"
+		if interrupted {
+			name = "cancel_during_delay"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				const delay = time.Second
+				if interrupted {
+					timer := time.AfterFunc(delay/2, cancel)
+					defer timer.Stop()
+				}
+				targets := make([]Target, 3)
+				started := make(chan time.Time, len(targets))
+				start := time.Now()
+				emitted := 0
+				err := scanTargets(ctx, targets, Options{}, len(targets), delay,
+					func(context.Context, Target, Options) Result {
+						started <- time.Now()
+						return Result{}
+					}, func(Result, bool) error { emitted++; return nil })
+				wantCount, wantElapsed := len(targets), 2*delay
+				var wantErr error
+				if interrupted {
+					wantCount, wantElapsed = 1, delay/2
+					wantErr = context.Canceled
+				}
+				if !errors.Is(err, wantErr) {
+					t.Fatalf("scheduler error = %v; want %v", err, wantErr)
+				}
+				if len(started) != wantCount || emitted != wantCount || time.Since(start) != wantElapsed {
+					t.Fatalf("started=%d emitted=%d elapsed=%v; want %d hosts in %v", len(started), emitted, time.Since(start), wantCount, wantElapsed)
+				}
+				for i := range wantCount {
+					if elapsed := (<-started).Sub(start); elapsed != time.Duration(i)*delay {
+						t.Errorf("launch %d at %v; want %v", i, elapsed, time.Duration(i)*delay)
+					}
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkSchedulerDelayedStarts(b *testing.B) {
+	targets := make([]Target, 32)
+	scan := func(context.Context, Target, Options) Result { return Result{} }
+	emit := func(Result, bool) error { return nil }
+	for _, tc := range []struct {
+		name        string
+		concurrency int
+	}{{"serial", 1}, {"concurrent", 4}} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := scanTargets(context.Background(), targets, Options{}, tc.concurrency, 100*time.Microsecond, scan, emit); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
 
 // These tests use the public CLI boundary so launch order, output, and progress
 // are verified together. Writers are synchronized for observations during scans.

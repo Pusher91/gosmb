@@ -8,6 +8,7 @@ import (
 	"crypto/rc4"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -96,34 +97,49 @@ func TestScanTargetAuthenticationFailureDoesNotProbeShares(t *testing.T) {
 	fixture.assertUnchanged(t, 0)
 }
 
-func TestScanTargetAuthenticationRejectionStatus(t *testing.T) {
+func TestScanTargetConnectionRejectionStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		status uint32
 		auth   string
 	}{
+		{"access_denied", 0xc0000022, "failed"},
+		{"logon_failure", 0xc000006d, "failed"},
+		{"account_restriction", 0xc000006e, "failed"},
 		{"expired_account", 0xc0000193, "failed"},
 		{"restricted_logon_hours", 0xc000006f, "failed"},
 		{"restricted_workstation", 0xc0000070, "failed"},
+		{"expired_password", 0xc0000071, "failed"},
+		{"disabled_account", 0xc0000072, "failed"},
+		{"password_must_change", 0xc0000224, "failed"},
+		{"locked_account", 0xc0000234, "failed"},
 		{"unsupported_server_operation", 0xc00000bb, "error"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			fixture := newEnumerationFixture(t, 0x001f01ff, 0x001f01ff, "success", false)
-			fixture.guard.mu.Lock()
-			fixture.guard.authenticationStatus = tc.status
-			fixture.guard.mu.Unlock()
-			result := scanTarget(context.Background(), fixture.target, fixture.options)
-			if !result.Reachable || result.Authentication != tc.auth || !result.authenticationComplete || result.TimedOut {
-				t.Errorf("authentication rejection = %+v; want completed %s", result, tc.auth)
-			}
-			if result.Enumeration != "not_attempted" || len(result.Shares) != 0 {
-				t.Errorf("authentication rejection probed shares: %+v", result)
-			}
-			if !strings.Contains(result.Error, fmt.Sprintf("0x%08x", tc.status)) {
-				t.Errorf("authentication rejection lost server status: %+v", result)
-			}
-			fixture.assertUnchanged(t, 0)
-		})
+		for _, phase := range []string{"negotiate", "session_setup"} {
+			t.Run(phase+"/"+tc.name, func(t *testing.T) {
+				fixture := newEnumerationFixture(t, 0x001f01ff, 0x001f01ff, "success", false)
+				wantAuth := tc.auth
+				fixture.guard.mu.Lock()
+				if phase == "negotiate" {
+					fixture.guard.negotiationStatus = tc.status
+					wantAuth = "error"
+				} else {
+					fixture.guard.authenticationStatus = tc.status
+				}
+				fixture.guard.mu.Unlock()
+				result := scanTarget(context.Background(), fixture.target, fixture.options)
+				if !result.Reachable || result.Authentication != wantAuth || !result.authenticationComplete || result.TimedOut {
+					t.Errorf("connection rejection = %+v; want completed %s", result, wantAuth)
+				}
+				if result.Enumeration != "not_attempted" || len(result.Shares) != 0 {
+					t.Errorf("authentication rejection probed shares: %+v", result)
+				}
+				if !strings.Contains(result.Error, fmt.Sprintf("0x%08x", tc.status)) {
+					t.Errorf("authentication rejection lost server status: %+v", result)
+				}
+				fixture.assertUnchanged(t, 0)
+			})
+		}
 	}
 }
 
@@ -154,6 +170,65 @@ func TestScanTargetReportsEnumerationCleanupDenial(t *testing.T) {
 			}
 			fixture.assertUnchanged(t, 1)
 		})
+	}
+}
+
+func TestScanTargetShareCleanupStatusControlsExitCode(t *testing.T) {
+	for _, cleanup := range []struct {
+		name    string
+		command uint16
+	}{
+		{"successful cleanup", 0},
+		{"close root handle", 6},
+		{"disconnect share", 4},
+	} {
+		for _, metadata := range []string{"success", "absent", "failed"} {
+			t.Run(cleanup.name+"/"+metadata, func(t *testing.T) {
+				fixture := newEnumerationFixture(t, 0x001f01ff, 0x001f01ff, metadata, false)
+				fixture.guard.mu.Lock()
+				fixture.guard.deniedDiskCleanup = cleanup.command
+				fixture.guard.mu.Unlock()
+				var out, errOut bytes.Buffer
+				deps := testCLIDeps(&out, &errOut)
+				deps.scan = scanTarget
+				code := runCLI(context.Background(), []string{fixture.target.String(), "-u", fixture.options.Username,
+					"-p", fixture.options.Password, "-d", fixture.options.Domain, "--json"}, deps)
+				var results []Result
+				if err := json.Unmarshal(out.Bytes(), &results); err != nil || len(results) != 1 {
+					t.Fatalf("invalid JSON report: %q; %v", out.String(), err)
+				}
+				result := results[0]
+				wantCode := 0
+				if cleanup.command != 0 {
+					wantCode = 1
+				}
+				if code != wantCode || result.Authentication != "authenticated" || result.Enumeration != "ok" || result.TimedOut {
+					t.Errorf("cleanup status changed the wrong outcome: exit=%d, want %d; result=%+v", code, wantCode, result)
+				}
+				if cleanup.command == 0 && result.Error != "" {
+					t.Errorf("unavailable metadata became a host error: %q", result.Error)
+				} else if cleanup.command != 0 && (!strings.Contains(result.Error, cleanup.name) || !strings.Contains(result.Error, "0xc0000022")) {
+					t.Errorf("host result lost the cleanup failure: %q", result.Error)
+				}
+				wantWrite := Allowed
+				if metadata != "success" {
+					wantWrite = Unknown
+				}
+				var disk ShareResult
+				for _, share := range result.Shares {
+					if share.Name == "data$" {
+						disk = share
+					}
+				}
+				if disk.Accessible != Allowed || disk.Read != Allowed || disk.Write != wantWrite {
+					t.Errorf("cleanup denial erased completed permissions: %+v", disk)
+				}
+				if cleanup.command != 0 && !strings.Contains(disk.Error, cleanup.name) {
+					t.Errorf("share result lost the cleanup failure: %q", disk.Error)
+				}
+				fixture.assertUnchanged(t, 1)
+			})
+		}
 	}
 }
 
@@ -365,8 +440,12 @@ func (f *enumerationFixture) assertUnchanged(t *testing.T, wantOpens int) {
 	if f.guard.opens != wantOpens {
 		t.Errorf("root open attempts = %d, want %d", f.guard.opens, wantOpens)
 	}
-	if f.guard.connections != 1 || f.guard.authAttempts != 1 {
-		t.Errorf("want exactly one TCP connection and authentication attempt; got connections=%d attempts=%d", f.guard.connections, f.guard.authAttempts)
+	wantAttempts := 1
+	if f.guard.negotiationStatus != 0 {
+		wantAttempts = 0
+	}
+	if f.guard.connections != 1 || f.guard.authAttempts != wantAttempts {
+		t.Errorf("want one TCP connection and %d authentication attempts; got connections=%d attempts=%d", wantAttempts, f.guard.connections, f.guard.authAttempts)
 	}
 	if f.guard.successful != f.guard.closed {
 		t.Errorf("opened %d handles but closed %d", f.guard.successful, f.guard.closed)
@@ -379,14 +458,18 @@ func (f *enumerationFixture) assertUnchanged(t *testing.T, wantOpens int) {
 type guardedEnumerationVFS struct {
 	mu                                                               sync.Mutex
 	denyList                                                         bool
+	negotiationStatus                                                uint32
 	authenticationStatus                                             uint32
 	enumerationStatus                                                uint32
 	malformedEnumeration                                             bool
 	rejectFirstOpen                                                  uint32
 	deniedIPCCleanup                                                 uint16
+	deniedDiskCleanup                                                uint16
 	opens, successful, closed, connections, authAttempts, guestOpens int
 	unexpected, wireUsers, wireDomains                               []string
 	guestEmptyPasswordVerified                                       bool
+	validationRequests                                               int
+	mismatchedNegotiation                                            bool
 }
 
 func (v *guardedEnumerationVFS) record(message string) {
@@ -401,6 +484,7 @@ type fixtureSMBServer struct {
 	shareMask, objectMask                       uint32
 	contextMode, authMode                       string
 	sessionKey, negotiate, challenge, pipeReply []byte
+	smbNegotiate                                []byte
 	sessionFlags                                uint16
 	authenticated                               bool
 	handles                                     map[uint64]*os.File
@@ -518,7 +602,8 @@ func (s *fixtureSMBServer) serve() {
 			return
 		}
 		s.fixture.guard.mu.Lock()
-		if tree == 1 && command == s.fixture.guard.deniedIPCCleanup {
+		if (tree == 1 && command == s.fixture.guard.deniedIPCCleanup) ||
+			(tree == 2 && command == s.fixture.guard.deniedDiskCleanup) {
 			status = 0xc0000022
 		}
 		s.fixture.guard.mu.Unlock()
@@ -561,20 +646,27 @@ func (s *fixtureSMBServer) dispatch(command uint16, p []byte) ([]byte, uint32, u
 	}
 	switch command {
 	case 0: // NEGOTIATE: SMB 2.1, signing enabled/required, no encryption.
-		if len(p) < 100 {
+		if len(p) < 100 || len(p) < 100+2*int(fxU16(p[66:])) {
 			return nil, 0, 0, errors.New("short NEGOTIATE")
 		}
+		s.smbNegotiate = append([]byte(nil), p...)
 		b := make([]byte, 64)
 		fxPut16(b, 65)
 		fxPut16(b[2:], 3)
 		fxPut16(b[4:], 0x0210)
 		copy(b[8:24], []byte("fixture-smb-guid!"))
+		guard.mu.Lock()
+		if guard.mismatchedNegotiation {
+			b[8] ^= 1 // The authenticated validation reply retains the real GUID.
+		}
+		status := guard.negotiationStatus
+		guard.mu.Unlock()
 		fxPut32(b[28:], 65536)
 		fxPut32(b[32:], 65536)
 		fxPut32(b[36:], 65536)
 		fxPut64(b[40:], 133000000000000000)
 		fxPut64(b[48:], 133000000000000000)
-		return b, 0, 0, nil
+		return b, status, 0, nil
 	case 1:
 		return s.sessionSetup(p)
 	case 2:
@@ -675,6 +767,44 @@ func (s *fixtureSMBServer) dispatch(command uint16, p []byte) ([]byte, uint32, u
 		fxPut32(b[4:], uint32(n))
 		copy(b[16:], s.pipeReply[:n])
 		s.pipeReply = s.pipeReply[n:]
+		return b, 0, tree, nil
+	case 11: // Only the connection-level secure-negotiate check is permitted.
+		if tree != 1 || len(p) < 120 || fxU16(p[64:]) != 57 || fxU32(p[68:]) != 0x00140204 ||
+			fxU64(p[72:]) != ^uint64(0) || fxU64(p[80:]) != ^uint64(0) ||
+			fxU32(p[88:]) != 120 || fxU32(p[96:]) != 0 || fxU32(p[100:]) != 120 ||
+			fxU32(p[104:]) != 0 || fxU32(p[108:]) != 24 || fxU32(p[112:]) != 1 ||
+			len(s.smbNegotiate) < 100 || !s.authenticated || len(s.sessionKey) == 0 {
+			return nil, 0, tree, errors.New("unexpected SMB IOCTL")
+		}
+		input, err := fxBounds(p, fxU32(p[88:]), fxU32(p[92:]))
+		if err != nil {
+			return nil, 0, tree, err
+		}
+		negotiate := s.smbNegotiate
+		count := int(fxU16(negotiate[66:]))
+		want := make([]byte, 24+2*count)
+		copy(want[:4], negotiate[72:76])
+		copy(want[4:20], negotiate[76:92])
+		copy(want[20:22], negotiate[68:70])
+		copy(want[22:24], negotiate[66:68])
+		copy(want[24:], negotiate[100:100+2*count])
+		if !bytes.Equal(input, want) {
+			return nil, 0, tree, errors.New("secure negotiation changed the original client offer")
+		}
+		guard.mu.Lock()
+		guard.validationRequests++
+		guard.mu.Unlock()
+		b := make([]byte, 48+24)
+		fxPut16(b, 49)
+		fxPut32(b[4:], 0x00140204)
+		fxPut64(b[8:], ^uint64(0))
+		fxPut64(b[16:], ^uint64(0))
+		fxPut32(b[24:], 112)
+		fxPut32(b[32:], 112)
+		fxPut32(b[36:], 24)
+		copy(b[52:68], []byte("fixture-smb-guid!"))
+		fxPut16(b[68:], 3)
+		fxPut16(b[70:], 0x0210)
 		return b, 0, tree, nil
 	default:
 		return nil, 0, tree, fmt.Errorf("unexpected SMB command %#x", command)

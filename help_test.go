@@ -13,6 +13,7 @@ func TestCLIHelpAlwaysShowsFullUsageWithoutSideEffects(t *testing.T) {
 		{"--help"},
 		{"-h"},
 		{"--help", "server", "-u", "alice", "-p", "secret", "--json"},
+		{"server", "-u", "alice", "-p", "invalid-\xff", "--help"},
 		{"server", "-u", "alice", "--help"},
 		{"server", "--guest", "-u", "alice", "--json", "--tsv", "-h"},
 		{"--timeout", "invalid", "server", "--help"},
@@ -82,6 +83,8 @@ func TestHelpTokensRemainOptionValues(t *testing.T) {
 		{[]string{"host", "-u", "alice", "-p=-h"}, "alice", "-h", ""},
 		{[]string{"host", "--user", "--help", "-p", ""}, "--help", "", ""},
 		{[]string{"host", "--user=-h", "--password=--help"}, "-h", "--help", ""},
+		{[]string{"host", "--username", "--help", "--pass", "-h"}, "--help", "-h", ""},
+		{[]string{"host", "--username=-h", "--pass=--help"}, "-h", "--help", ""},
 		{[]string{"host", "-u", "alice", "-d", "-h", "-p", ""}, "alice", "", "-h"},
 	} {
 		cfg, err := parseCLI(context.Background(), tt.args)

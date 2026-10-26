@@ -64,7 +64,12 @@ class Observer:
         self.encrypted = collections.Counter()
         self.signed = collections.Counter()
         self.trees = {}
+        self.tree_names = {}
+        self.pending_tree_name = None
         self.dialect = None
+        self.client_negotiate = None
+        self.server_negotiate = None
+        self.validation_status = None
         self.rpc_calls = set()
         self.rpc_requests = []
         self.rpc_pages = []
@@ -160,8 +165,29 @@ class Observer:
         if not request:
             if command == 0 and status == 0:
                 self.dialect = u16(packet, 68)
+                self.server_negotiate = packet[88:92] + packet[72:88] + packet[66:70]
             if command == 3 and status == 0:
                 self.trees[tree] = packet[66]
+                self.tree_names[tree] = self.pending_tree_name
+            if command == 11 and status != 0x103:
+                require(self.commands[11] == 1 and self.validation_status is None,
+                        "unexpected secure-negotiate response")
+                self.validation_status = status
+                if status == 0:
+                    require(len(packet) >= 112 and u16(packet, 64) == 49
+                            and u32(packet, 68) == 0x00140204
+                            and packet[72:88] == b"\xff" * 16
+                            and u32(packet, 92) == 0 and u32(packet, 100) == 24
+                            and u32(packet, 104) == 0,
+                            "invalid secure-negotiate response")
+                    start = u32(packet, 96)
+                    require(start >= 112 and start % 8 == 0
+                            and packet[start:start + 24] == self.server_negotiate,
+                            "secure negotiation changed the original server response")
+                else:
+                    require(self.dialect < 0x300
+                            and status in (0xc00000bb, 0xc0000010, 0xc0000128),
+                            "secure negotiation failed")
             if command == 8 and status in (0, 0x80000005):
                 start, count = packet[66], u32(packet, 68)
                 self.rpc_pending.extend(packet[start:start + count])
@@ -200,8 +226,36 @@ class Observer:
             return
 
         self.commands[command] += 1
-        require(command in (0, 1, 2, 3, 4, 5, 6, 8, 9),
+        require(command in (0, 1, 2, 3, 4, 5, 6, 8, 9, 11),
                 f"unexpected SMB command {command}")
+        if command == 0:
+            count = u16(packet, 66)
+            require(len(packet) >= 100 + 2 * count, "incomplete negotiate dialects")
+            self.client_negotiate = (packet[72:92] + packet[68:70]
+                                     + packet[66:68] + packet[100:100 + 2 * count])
+        if command == 3:
+            start, count = u16(packet, 68), u16(packet, 70)
+            path = packet[start:start + count].decode("utf-16-le")
+            self.pending_tree_name = path.rsplit("\\", 1)[-1].casefold()
+        if command == 11:
+            require(self.identity == "authenticated" and self.dialect != 0x311
+                    and self.commands[11] == 1 and self.trees.get(tree) == 2
+                    and self.tree_names.get(tree) == "ipc$"
+                    and len(packet) >= 120 and u16(packet, 64) == 57
+                    and u32(packet, 68) == 0x00140204
+                    and packet[72:88] == b"\xff" * 16
+                    and u32(packet, 88) == 120 and u32(packet, 96) == 0
+                    and u32(packet, 100) == 120 and u32(packet, 104) == 0
+                    and u32(packet, 108) == 24 and u32(packet, 112) == 1,
+                    "unexpected SMB IOCTL")
+            count = u32(packet, 92)
+            require(self.client_negotiate is not None
+                    and count == len(self.client_negotiate) and len(packet) == 120 + count
+                    and packet[120:120 + count] == self.client_negotiate,
+                    "secure negotiation changed the original client offer")
+        if command in (5, 8, 9) and self.identity == "authenticated" and self.dialect != 0x311:
+            require(self.validation_status is not None,
+                    "share probing began before secure negotiation finished")
         if command == 5:
             name_at, name_size = u16(packet, 108), u16(packet, 110)
             name = packet[name_at:name_at + name_size].decode("utf-16-le")
@@ -288,15 +342,37 @@ def scan(binary, endpoint, dialect, mode, credentials, expected, bulk=0, target_
     require(observer.commands[0] == 1 and observer.commands[1] == 2,
             f"unexpected negotiate/authentication attempts: {observer.commands}")
     require(observer.dialect == DIALECTS[dialect], "wrong negotiated dialect")
-    result = json.loads(completed.stdout)[0]
+    results = json.loads(completed.stdout)
+    require(isinstance(results, list) and len(results) == 1 and isinstance(results[0], dict),
+            "expected exactly one JSON host result")
+    result = results[0]
     require(result["target"] == target, "requested target spelling was changed")
+    require(not result.get("timed_out", False), "unexpected scan timeout")
     if expected == "failed":
         require(completed.returncode == 1 and result["authentication"] == "failed"
                 and result["enumeration"] == "not_attempted" and not result["shares"],
                 f"bad password accepted: {result}")
     else:
-        require(completed.returncode == 0, completed.stderr or completed.stdout)
         check_result(result, expected, encrypted, bulk)
+        # Samba can reject TREE_DISCONNECT on the deliberately inaccessible
+        # root. Keep that cleanup failure observable without accepting any
+        # other host error or mistaking it for failed permission enumeration.
+        cleanup_shares = [share for share in result["shares"]
+                          if "close root handle:" in share.get("error", "")
+                          or "disconnect share:" in share.get("error", "")]
+        cleanup_error = None
+        if cleanup_shares:
+            require(expected == "authenticated" and len(cleanup_shares) == 1
+                    and cleanup_shares[0]["name"] == "denied"
+                    and cleanup_shares[0]["error"] == (
+                        "root access query: request: SMB status 0xc0000022\n"
+                        "disconnect share: request: SMB status 0xc0000022"),
+                    f"unexpected cleanup failure: {cleanup_shares}")
+            cleanup_error = "share denied cleanup: disconnect share: request: SMB status 0xc0000022"
+        require(result.get("error") == cleanup_error,
+                f"unexpected host error: {result.get('error')}")
+        require(completed.returncode == int(cleanup_error is not None),
+                completed.stderr or completed.stdout)
         fallback = expected == "guest" and credentials != ["--guest"]
         require(result["guest_fallback"] == fallback, "wrong guest fallback label")
         if encrypted:
@@ -304,6 +380,11 @@ def scan(binary, endpoint, dialect, mode, credentials, expected, bulk=0, target_
                     "SMB3 user traffic was not encrypted in both directions")
         else:
             require(not observer.encrypted, "unexpected encryption")
+            validate = expected == "authenticated" and DIALECTS[dialect] != 0x311
+            require(observer.commands[11] == int(validate),
+                    "incorrect number of secure-negotiate requests")
+            require((observer.validation_status is not None) == validate,
+                    "secure negotiation did not finish")
             require(len(observer.rpc_pages) == len(observer.rpc_calls)
                     and observer.rpc_pages and observer.rpc_pages[-1][1] == 0
                     and not observer.rpc_request_stubs and not observer.rpc_response_stubs,
@@ -319,6 +400,8 @@ def scan(binary, endpoint, dialect, mode, credentials, expected, bulk=0, target_
     return {"identity": expected, "target": target, "connections": observer.connections,
             "session_setup_requests": observer.commands[1],
             "encrypted_requests": observer.encrypted[True],
+            "negotiate_validation_status": None if encrypted else observer.validation_status,
+            "cleanup_failure_reported": bool(result.get("error")) if expected != "failed" else False,
             "enumeration_pages": None if encrypted else len(observer.rpc_pages),
             "more_data_responses": None if encrypted else observer.rpc_more_data,
             "pagination_exercised": None if encrypted else observer.rpc_more_data > 0,

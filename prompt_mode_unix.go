@@ -16,9 +16,14 @@ func passwordTerminalMode(fd int) (restore func() error, err error) {
 	mode := *original
 	// Keep the terminal's normal line editing and signal handling, including
 	// its configured erase and interrupt characters, while hiding the password.
-	mode.Lflag &^= unix.ECHO
+	// External processing bypasses the canonical input processing we rely on.
+	mode.Lflag &^= unix.ECHO | passwordExternalProcessingFlag
 	mode.Lflag |= unix.ICANON | unix.ISIG
-	mode.Iflag |= unix.ICRNL
+	// Inherited byte mappings must not drop Enter, corrupt UTF-8, duplicate
+	// 0xff bytes, or change password case. Keep only CR-to-NL normalization.
+	mode.Iflag &^= unix.IGNCR | unix.INLCR | unix.ISTRIP | unix.PARMRK | passwordInputCaseFlag
+	// UTF-8-aware erase removes an entire character rather than its final byte.
+	mode.Iflag |= unix.ICRNL | passwordUTF8Flag
 	if err := unix.IoctlSetTermios(fd, passwordSetTermios, &mode); err != nil {
 		return nil, err
 	}

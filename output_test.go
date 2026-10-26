@@ -18,7 +18,7 @@ func BenchmarkTextOutput(b *testing.B) {
 	for _, tc := range []struct {
 		name  string
 		write func(io.Writer, Result) error
-	}{{"TSV", writeTextResult}, {"aligned", writeAlignedResult}} {
+	}{{"TSV", writeTextResult}, {"aligned", func(out io.Writer, result Result) error { return writeAlignedResult(out, result, false) }}} {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
@@ -38,6 +38,33 @@ func BenchmarkRedactResult(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		redactResult(result, "synthetic-password")
+	}
+}
+
+func BenchmarkJSONOutput(b *testing.B) {
+	for _, tc := range []struct {
+		name          string
+		hosts, shares int
+	}{
+		{"1000_empty", 1000, 0},
+		{"65536_empty", 65536, 0},
+		{"1000_eight_shares", 1000, 8},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			results := make([]Result, tc.hosts)
+			for i := range results {
+				results[i] = Result{Target: fmt.Sprintf("fileserver-%d:445", i), ServerIP: "192.0.2.25", Authentication: "authenticated", Enumeration: "ok"}
+				for range tc.shares {
+					results[i].Shares = append(results[i].Shares, ShareResult{Name: "documents and archives", Read: Allowed, Write: Denied})
+				}
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := writeJSONResults(io.Discard, results); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
@@ -230,6 +257,123 @@ func TestJSONOutputIsArrayAndPreservesData(t *testing.T) {
 	}
 }
 
+func TestJSONOutputPreservesArrayFormattingAndOwnership(t *testing.T) {
+	input := []Result{
+		{Target: "first:445"},
+		{Target: "second:445", Authentication: "authenticated", Enumeration: "ok", Shares: []ShareResult{{Name: "資料 <&>\"\\\n\x1b", Read: Allowed, Write: Unknown}}},
+		{Target: "third:445", TimedOut: true, Error: "timed out"},
+	}
+	wantResults := append([]Result(nil), input...)
+	wantResults[0].Shares, wantResults[2].Shares = []ShareResult{}, []ShareResult{}
+	var want, got bytes.Buffer
+	enc := json.NewEncoder(&want)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(wantResults); err != nil {
+		t.Fatal(err)
+	}
+	before, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONResults(&got, input); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Bytes(), want.Bytes()) {
+		t.Fatalf("JSON formatting changed:\n%s\nwant:\n%s", got.Bytes(), want.Bytes())
+	}
+	after, err := json.Marshal(input)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("JSON output modified caller-owned results or shares")
+	}
+}
+
+func TestJSONOutputBoundsBatchesAcrossHosts(t *testing.T) {
+	input := make([]Result, 1000)
+	for i := range input {
+		input[i].Target = fmt.Sprintf("server-%04d:445", i)
+	}
+	var combined bytes.Buffer
+	writes := 0
+	out := outputWriteFunc(func(data []byte) (int, error) {
+		writes++
+		if len(data) > 16<<10 {
+			t.Fatalf("small hosts accumulated into an unbounded write: %d bytes", len(data))
+		}
+		return combined.Write(data)
+	})
+	if err := writeJSONResults(out, input); err != nil {
+		t.Fatal(err)
+	}
+	if writes < 2 {
+		t.Fatal("report was retained in one output buffer")
+	}
+	var decoded []Result
+	if err := json.Unmarshal(combined.Bytes(), &decoded); err != nil || len(decoded) != len(input) {
+		t.Fatalf("batched JSON lost results: count=%d error=%v", len(decoded), err)
+	}
+	for i, result := range decoded {
+		if result.Target != input[i].Target || result.Shares == nil || input[i].Shares != nil {
+			t.Fatalf("result %d lost order, array shape, or caller ownership", i)
+		}
+	}
+}
+
+func TestJSONOutputStopsAtWriteFailures(t *testing.T) {
+	input := []Result{{Target: "first"}, {Target: "second"}, {Target: "third"}}
+	for i := range input {
+		input[i].Shares = []ShareResult{{Name: strings.Repeat("x", 20000)}}
+	}
+	var complete bytes.Buffer
+	if err := writeJSONResults(&complete, input); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		results []Result
+		output  string
+		failAt  int
+	}{
+		{"empty", nil, "[]\n", 0},
+		{"empty_closing", []Result{}, "[]\n", 1},
+		{"opening", input, complete.String(), 0},
+		{"middle_host", input, complete.String(), strings.Index(complete.String(), `"second"`) + 4},
+		{"last_host", input, complete.String(), strings.Index(complete.String(), `"third"`) + 4},
+		{"closing", input, complete.String(), complete.Len() - 2},
+	} {
+		for _, short := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/short=%t", tc.name, short), func(t *testing.T) {
+				var partial bytes.Buffer
+				failed := false
+				out := outputWriteFunc(func(data []byte) (int, error) {
+					if failed {
+						t.Fatal("continued output after writer failure")
+					}
+					remaining := tc.failAt - partial.Len()
+					if len(data) <= remaining {
+						return partial.Write(data)
+					}
+					failed = true
+					partial.Write(data[:remaining])
+					if short {
+						return remaining, nil
+					}
+					return remaining, io.ErrClosedPipe
+				})
+				wantErr := io.ErrClosedPipe
+				if short {
+					wantErr = io.ErrShortWrite
+				}
+				if err := writeJSONResults(out, tc.results); !errors.Is(err, wantErr) {
+					t.Fatalf("write error = %v; want %v", err, wantErr)
+				}
+				if !failed || partial.String() != tc.output[:tc.failAt] {
+					t.Fatal("failed output lost the successfully written prefix")
+				}
+			})
+		}
+	}
+}
+
 type shortOutputWriter struct{}
 
 func (shortOutputWriter) Write(p []byte) (int, error) { return len(p) / 2, nil }
@@ -243,7 +387,8 @@ func TestOutputRejectsShortWrites(t *testing.T) {
 		{"TSV header", writeTextHeader},
 		{"aligned header", writeAlignedHeader},
 		{"TSV result", func(out io.Writer) error { return writeTextResult(out, result) }},
-		{"aligned result", func(out io.Writer) error { return writeAlignedResult(out, result) }},
+		{"aligned result", func(out io.Writer) error { return writeAlignedResult(out, result, false) }},
+		{"colored result", func(out io.Writer) error { return writeAlignedResult(out, result, true) }},
 		{"diagnostics", func(out io.Writer) error { return writeTextDiagnostics(out, result) }},
 		{"JSON", func(out io.Writer) error { return writeJSONResults(out, []Result{result}) }},
 	} {
@@ -293,43 +438,87 @@ func TestTSVBatchesCompleteRowsWithoutTruncation(t *testing.T) {
 	}
 }
 
-func TestTSVStopsAfterFailedBatch(t *testing.T) {
-	for _, short := range []bool{false, true} {
-		name := "write_error"
-		if short {
-			name = "short_write"
+func TestDiagnosticsBatchesCompleteLines(t *testing.T) {
+	result := Result{Target: "server\n:445", Error: "host\rerror", Shares: make([]ShareResult, 2000)}
+	var expected bytes.Buffer
+	expected.WriteString("gosmb: server\\n:445: host\\rerror\n")
+	for i := range result.Shares {
+		result.Shares[i].Name = fmt.Sprintf("share-%04d\t", i)
+		if i%7 != 0 {
+			result.Shares[i].Error = "query failed\x1b[2J\n"
+			fmt.Fprintf(&expected, "gosmb: server\\n:445: share-%04d\\t: query failed\\x1b[2J\\n\n", i)
 		}
-		t.Run(name, func(t *testing.T) {
-			result := Result{Target: "server:445", Shares: make([]ShareResult, 2000)}
-			for i := range result.Shares {
-				result.Shares[i] = ShareResult{Name: "documents and archives", Read: Allowed, Write: Denied}
+	}
+	var combined bytes.Buffer
+	writes := 0
+	out := outputWriteFunc(func(data []byte) (int, error) {
+		writes++
+		if len(data) > (16<<10)+512 {
+			t.Fatalf("diagnostics accumulated beyond one batch plus its final line: %d bytes", len(data))
+		}
+		if !bytes.HasSuffix(data, []byte{'\n'}) {
+			t.Fatal("diagnostic batch ended in an incomplete line")
+		}
+		for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
+			if !strings.HasPrefix(line, "gosmb: ") {
+				t.Fatalf("diagnostic batch contains an incomplete or unescaped line: %q", line)
 			}
-			writes := 0
-			var complete bytes.Buffer
-			out := outputWriteFunc(func(data []byte) (int, error) {
-				writes++
-				if writes == 1 {
-					return complete.Write(data)
-				}
-				if short {
-					return len(data) / 2, nil
-				}
-				return 0, io.ErrClosedPipe
-			})
-			wantErr := io.ErrClosedPipe
+		}
+		return combined.Write(data)
+	})
+	if err := writeTextDiagnostics(out, result); err != nil {
+		t.Fatal(err)
+	}
+	if writes < 2 {
+		t.Fatal("large host's diagnostics were retained in one output buffer")
+	}
+	if !bytes.Equal(combined.Bytes(), expected.Bytes()) {
+		t.Fatal("batched diagnostics lost their contents, escaping, or order")
+	}
+}
+
+func TestTextOutputStopsAfterFailedBatch(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		write func(io.Writer, Result) error
+	}{{"TSV", writeTextResult}, {"diagnostics", writeTextDiagnostics}} {
+		for _, short := range []bool{false, true} {
+			name := "write_error"
 			if short {
-				wantErr = io.ErrShortWrite
+				name = "short_write"
 			}
-			if err := writeTextResult(out, result); !errors.Is(err, wantErr) {
-				t.Fatalf("failed batch error = %v; want %v", err, wantErr)
-			}
-			if writes != 2 {
-				t.Fatalf("writes = %d; expected one completed batch followed by the failure", writes)
-			}
-			if rows := parseTestTSV(t, complete.String()); len(rows) >= len(result.Shares) {
-				t.Fatal("failed batch did not retain earlier partial results")
-			}
-		})
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				result := Result{Target: "server:445", Shares: make([]ShareResult, 2000)}
+				for i := range result.Shares {
+					result.Shares[i] = ShareResult{Name: "documents and archives", Read: Allowed, Write: Denied, Error: "root access failed"}
+				}
+				writes := 0
+				var complete bytes.Buffer
+				out := outputWriteFunc(func(data []byte) (int, error) {
+					writes++
+					if writes == 1 {
+						return complete.Write(data)
+					}
+					if short {
+						return len(data) / 2, nil
+					}
+					return 0, io.ErrClosedPipe
+				})
+				wantErr := io.ErrClosedPipe
+				if short {
+					wantErr = io.ErrShortWrite
+				}
+				if err := tc.write(out, result); !errors.Is(err, wantErr) {
+					t.Fatalf("failed batch error = %v; want %v", err, wantErr)
+				}
+				if writes != 2 {
+					t.Fatalf("writes = %d; expected one completed batch followed by the failure", writes)
+				}
+				if lines := bytes.Count(complete.Bytes(), []byte{'\n'}); lines == 0 || lines >= len(result.Shares) || !bytes.HasSuffix(complete.Bytes(), []byte{'\n'}) {
+					t.Fatal("failed batch did not retain earlier complete lines")
+				}
+			})
+		}
 	}
 }
 
@@ -348,13 +537,14 @@ func TestTSVRepeatsEndpointAndGuestFallbackForEveryShare(t *testing.T) {
 		t.Fatalf("TSV lost per-share permissions/fallback: %q", out.String())
 	}
 	r.GuestFallback = false
+	r.explicitGuest = true
 	out.Reset()
 	if err := writeTextResult(&out, r); err != nil {
 		t.Fatal(err)
 	}
 	for _, row := range parseTestTSV(t, out.String()) {
-		if row[4] != "FALSE" {
-			t.Fatalf("explicit guest incorrectly labeled as fallback: %#v", row)
+		if row[4] != "N/A" {
+			t.Fatalf("explicit guest must mark fallback as not applicable: %#v", row)
 		}
 	}
 }
@@ -395,16 +585,16 @@ func TestTSVKeepsFailedAndEmptyServersVisible(t *testing.T) {
 	}
 }
 
-func TestAlignedOutputKeepsLongCellsOnOneLine(t *testing.T) {
+func TestAlignedOutputBoundsLongCellsAndPreservesHostname(t *testing.T) {
 	ip := "2001:db8:1234:5678:90ab:cdef:1234:5678%interface"
 	hostname := strings.Repeat("long-hostname-", 4) + "files.example.com"
 	name := strings.Repeat("é", 90) + "\tend"
-	result := Result{Target: hostname + ":1445", ServerIP: ip, GuestFallback: true, Shares: []ShareResult{{Name: name, Read: Allowed, Write: Denied}}}
+	result := Result{Target: hostname + ":1445", ServerIP: ip, Reachable: true, Authentication: "guest", Enumeration: "ok", GuestFallback: true, Shares: []ShareResult{{Name: name, Accessible: Allowed, Read: Allowed, Write: Denied}}}
 	var out bytes.Buffer
 	if err := writeAlignedHeader(&out); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeAlignedResult(&out, result); err != nil {
+	if err := writeAlignedResult(&out, result, false); err != nil {
 		t.Fatal(err)
 	}
 	if strings.ContainsAny(out.String(), "\t\r\x1b") {
@@ -414,15 +604,39 @@ func TestAlignedOutputKeepsLongCellsOnOneLine(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("want exactly one header and one data line: %q", out.String())
 	}
-	if got := strings.Fields(lines[0]); strings.Join(got, "|") != "TARGET_IP|SHARE|READ|WRITE|GUEST|HOSTNAME" {
+	if got := strings.Fields(lines[0]); strings.Join(got, "|") != "TARGET_IP|SHARE|READ|WRITE|GUEST|STATUS|HOSTNAME" {
 		t.Fatalf("unexpected terminal header: %q", lines[0])
 	}
-	want := []string{"[" + ip + "]:1445", strings.Repeat("é", 90) + `\tend`, "TRUE", "FALSE", "TRUE", hostname}
+	endpoint := "[" + ip + "]:1445"
+	want := []string{endpoint[:20] + "…", strings.Repeat("é", 19) + "…", "TRUE", "FALSE", "TRUE", "OK", hostname}
 	if got := strings.Fields(lines[1]); strings.Join(got, "|") != strings.Join(want, "|") {
-		t.Fatalf("long fields were wrapped, truncated, or joined: %q", lines[1])
+		t.Fatalf("long fields were not bounded in their own columns: %q", lines[1])
 	}
 	if !strings.HasSuffix(lines[1], hostname) {
 		t.Fatalf("hostname must be the full final column: %q", lines[1])
+	}
+}
+
+func TestStatusColorsPreserveAlignmentAndEscapeServerText(t *testing.T) {
+	result := Result{Target: "FALSE:445", ServerIP: "192.0.2.1", GuestFallback: true, Shares: []ShareResult{
+		{Name: "TRUE", Read: Allowed, Write: Denied},
+		{Name: "FALSE", Read: Unknown, Write: TimedOut},
+		{Name: "untrusted\x1b[31m", Read: NotApplicable, Write: NotApplicable},
+	}}
+	var plain, colored bytes.Buffer
+	if err := writeAlignedResult(&plain, result, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAlignedResult(&colored, result, true); err != nil {
+		t.Fatal(err)
+	}
+	output := colored.String()
+	if strings.Count(output, "\x1b[32mTRUE\x1b[0m") != 4 || strings.Count(output, "\x1b[31mFALSE\x1b[0m") != 1 {
+		t.Fatalf("colors were missing or applied outside status columns: %q", output)
+	}
+	stripped := strings.NewReplacer("\x1b[32m", "", "\x1b[31m", "", "\x1b[0m", "").Replace(output)
+	if stripped != plain.String() || !strings.Contains(stripped, `untrusted\x1b[31m`) {
+		t.Fatalf("colors changed visible columns or server-text escaping: %q", output)
 	}
 }
 
@@ -433,6 +647,7 @@ func TestTimeoutOutputPreservesKnownPermissionsAndAuthentication(t *testing.T) {
 		want   string
 	}{
 		{"before authentication", Result{TimedOut: true, Authentication: TimedOut, Enumeration: TimedOut}, "UNKNOWN|-|TIMEOUT|TIMEOUT|TIMEOUT|-"},
+		{"explicit guest before authentication", Result{TimedOut: true, Authentication: TimedOut, Enumeration: TimedOut, explicitGuest: true}, "UNKNOWN|-|TIMEOUT|TIMEOUT|N/A|-"},
 		{"authenticated", Result{Target: "192.0.2.1:445", ServerIP: "192.0.2.1", TimedOut: true, Authentication: "authenticated", Enumeration: TimedOut}, "192.0.2.1:445|-|TIMEOUT|TIMEOUT|FALSE|-"},
 		{"guest fallback", Result{Target: "192.0.2.1:445", ServerIP: "192.0.2.1", TimedOut: true, Authentication: "guest", GuestFallback: true, Enumeration: TimedOut}, "192.0.2.1:445|-|TIMEOUT|TIMEOUT|TRUE|-"},
 		{"empty list before cleanup timeout", Result{Target: "192.0.2.1:445", TimedOut: true, Authentication: "authenticated", Enumeration: "ok", enumerationComplete: true}, "192.0.2.1:445|-|UNKNOWN|UNKNOWN|FALSE|-"},

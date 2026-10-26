@@ -20,6 +20,7 @@ Tokens used as option values or placed after `--` are not treated as help option
 Omit `-p` for a hidden password prompt. `GOSMB_PASSWORD` is also supported. An
 explicit `-p ''` supplies an empty password. Command-line passwords can appear in
 process arguments and shell history; the application never logs credentials.
+Passwords must be valid UTF-8; malformed input is rejected before scanning.
 
 If the server maps supplied credentials to Guest, the scan continues using that
 same session and reports Guest's permissions with **GUEST = TRUE**.
@@ -63,6 +64,10 @@ the **existing root directory**, closes that handle, and disconnects the tree.
 No directory entries or file contents are fetched. There can be one additional
 read-only open if LIST access is denied or maximum-access queries are unsupported.
 Server pagination is followed when necessary to obtain the share list.
+
+Authenticated sessions below SMB 3.1.1 also send one signed negotiation-validation
+request on the first tree connection, before enumeration. This checks connection
+parameters and does not open or modify a filesystem object.
 
 SMB names the open-handle request `CREATE`, but every disk request uses
 `FILE_OPEN`, which cannot create a new filesystem object. Desired access is only
@@ -119,8 +124,9 @@ A host interrupted by canceling the command mid-check is not counted as complete
 any partial results returned for that
 host are still printed. Ctrl-C/SIGTERM leaves the current counts marked
 `(interrupted)`. Progress only redraws its own line; previous results remain in
-terminal scrollback. A force kill cannot print a final status but does not erase
-already printed rows.
+terminal scrollback. A second Ctrl-C/SIGTERM terminates immediately if orderly
+shutdown stalls, including when output is blocked. A force kill cannot print a
+final status but does not erase already printed rows.
 
 The footer goes to stderr only when stderr is a terminal, keeping TSV and JSON
 clean. Use `--no-progress` to hide it. Redirected stderr has diagnostics without
@@ -296,6 +302,9 @@ response signatures and prefers encryption when negotiated. SMB2 uses
 HMAC-SHA256; SMB3 uses AES-CMAC, with AES-128-CCM encryption for SMB 3.0/3.0.2
 and AES-128-GCM for SMB 3.1.1. SMB 3.1.1 also verifies preauthentication integrity
 through the derived session keys. Guest sessions have neither signing nor encryption.
+Authentication rejects contradictory SPNEGO completion states. If the server
+requests a mechanism-list MIC exchange, an authenticated user session requires
+a valid final server MIC before share enumeration.
 SMB1, Kerberos, interactive shells, relay mode, downloads, and
 uploads are not exposed.
 
@@ -321,10 +330,20 @@ pagination is covered by local fixtures rather than this independent server.
 Windows and NAS interoperability remain untested unless separately verified in
 your environment.
 
-Known protocol limitation: SMB 3.0/3.0.2 negotiation does not perform signed
-`FSCTL_VALIDATE_NEGOTIATE_INFO`; those dialects lack negotiation-transcript
-validation. SMB 3.1.1 uses preauthentication integrity. SMB2 also lacks that
-transcript protection.
+Authenticated SMB 3.0/3.0.2 sessions require successful
+`FSCTL_VALIDATE_NEGOTIATE_INFO` validation of the original client and server
+negotiation fields. Unauthenticated, altered, malformed, or rejected validation replies
+terminate the connection before enumeration. SMB 3.1.1 uses preauthentication
+integrity instead.
 
-Protocol references: [tree-connect maximum access](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/dd34e26c-a75e-47fa-aab2-6efc27502e96),
+SMB 2.0.2/2.1 sessions attempt the same check, but retain compatibility with
+older servers that return a signed `STATUS_NOT_SUPPORTED`,
+`STATUS_INVALID_DEVICE_REQUEST`, or `STATUS_FILE_CLOSED`. Those responses establish
+the server's authenticated refusal; they do not validate the original negotiation
+fields. Guest sessions cannot perform authenticated negotiation validation.
+
+Protocol references: [SPNEGO negotiation and MICs](https://www.rfc-editor.org/rfc/rfc4178.html#section-5),
+[secure negotiation](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/5b80eb31-7e0a-4f24-b570-15217d28f239),
+[validation replies](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/6a5bc90d-3c08-4498-905b-e7dab30b2e0e),
+[tree-connect maximum access](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/dd34e26c-a75e-47fa-aab2-6efc27502e96),
 [maximum-access response](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/0fe6be15-3a76-4032-9a44-56f846ac6244).

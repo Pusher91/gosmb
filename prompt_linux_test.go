@@ -282,3 +282,121 @@ func TestPasswordPromptEnterAuthenticatesAndRestoresTerminal(t *testing.T) {
 	}
 	fixture.assertUnchanged(t, 1)
 }
+
+func TestPasswordPromptLeavesLineEditingToTerminal(t *testing.T) {
+	for _, name := range []string{"configured_erase", "quoted_backspace", "quoted_carriage_return"} {
+		t.Run(name, func(t *testing.T) {
+			terminal := newPromptTerminal(t)
+			input, want := "px"+string(terminal.before.Cc[unix.VERASE])+"ass\n", "pass"
+			switch name {
+			case "quoted_backspace":
+				// Quote a backspace so the terminal delivers it literally. It
+				// must not delete a byte from the preceding UTF-8 character.
+				input = "pä" + string(terminal.before.Cc[unix.VLNEXT]) + "\bss\n"
+				want = "pä\bss"
+			case "quoted_carriage_return":
+				input = "pä" + string(terminal.before.Cc[unix.VLNEXT]) + "\rss\n"
+				want = "pä\rss"
+			}
+			out := promptOutputFunc(func(data []byte) (int, error) {
+				if string(data) == "Password: " {
+					if _, err := unix.Write(terminal.master, []byte(input)); err != nil {
+						return 0, err
+					}
+				}
+				return len(data), nil
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			password, err := promptPassword(ctx, terminal.slave, out)
+			if err != nil || password != want {
+				t.Fatalf("terminal-edited password was changed: got length=%d want length=%d err=%v", len(password), len(want), err)
+			}
+			after, err := unix.IoctlGetTermios(int(terminal.slave.Fd()), unix.TCGETS)
+			if err != nil || !reflect.DeepEqual(after, terminal.before) {
+				t.Fatalf("prompt did not restore terminal modes: %v", err)
+			}
+		})
+	}
+}
+
+func TestPasswordPromptNormalizesInheritedInputMappings(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		flag        uint32
+		input, want string
+	}{
+		{"ignored_carriage_return", unix.IGNCR, "secret\r", "secret"},
+		{"newline_to_carriage_return", unix.INLCR, "secret\n", "secret"},
+		{"stripped_high_bit", unix.ISTRIP, "päss\n", "päss"},
+		{"marked_ff_byte", unix.PARMRK, "p\xffss\n", "p\xffss"},
+		{"lowercased_input", unix.IUCLC, "PaSS\n", "PaSS"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			terminal := newPromptTerminal(t)
+			inherited := *terminal.before
+			inherited.Iflag |= tc.flag
+			if err := unix.IoctlSetTermios(int(terminal.slave.Fd()), unix.TCSETS, &inherited); err != nil {
+				t.Fatal(err)
+			}
+			out := promptOutputFunc(func(data []byte) (int, error) {
+				if string(data) == "Password: " {
+					if _, err := unix.Write(terminal.master, []byte(tc.input)); err != nil {
+						return 0, err
+					}
+				}
+				return len(data), nil
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			password, err := promptPassword(ctx, terminal.slave, out)
+			if err != nil || password != tc.want {
+				t.Errorf("inherited input mode changed or blocked password entry: got length=%d want length=%d err=%v", len(password), len(tc.want), err)
+			}
+			after, err := unix.IoctlGetTermios(int(terminal.slave.Fd()), unix.TCGETS)
+			if err != nil || !reflect.DeepEqual(after, &inherited) {
+				t.Errorf("prompt did not restore inherited terminal modes: %v", err)
+			}
+		})
+	}
+}
+
+func TestPasswordPromptNormalizesEditingModes(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		configure func(*unix.Termios)
+		input     func(*unix.Termios) string
+	}{
+		{"utf8_erase", func(mode *unix.Termios) { mode.Iflag &^= unix.IUTF8 },
+			func(mode *unix.Termios) string { return "p😀" + string(mode.Cc[unix.VERASE]) + "ass\n" }},
+		{"external_processing", func(mode *unix.Termios) { mode.Lflag |= unix.EXTPROC },
+			func(*unix.Termios) string { return "pass\r" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			terminal := newPromptTerminal(t)
+			inherited := *terminal.before
+			tc.configure(&inherited)
+			if err := unix.IoctlSetTermios(int(terminal.slave.Fd()), unix.TCSETS, &inherited); err != nil {
+				t.Fatal(err)
+			}
+			out := promptOutputFunc(func(data []byte) (int, error) {
+				if string(data) == "Password: " {
+					if _, err := unix.Write(terminal.master, []byte(tc.input(&inherited))); err != nil {
+						return 0, err
+					}
+				}
+				return len(data), nil
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			password, err := promptPassword(ctx, terminal.slave, out)
+			if err != nil || password != "pass" {
+				t.Errorf("terminal editing corrupted or blocked password: length=%d err=%v", len(password), err)
+			}
+			after, err := unix.IoctlGetTermios(int(terminal.slave.Fd()), unix.TCGETS)
+			if err != nil || !reflect.DeepEqual(after, &inherited) {
+				t.Errorf("prompt did not restore inherited terminal modes: %v", err)
+			}
+		})
+	}
+}

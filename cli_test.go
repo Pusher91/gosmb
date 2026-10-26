@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestParseCLIFlagsAfterTarget(t *testing.T) {
@@ -354,6 +355,8 @@ func TestCLIPasswordSourcesAndNoSecretOutput(t *testing.T) {
 	}{
 		{"explicit", []string{"-p", "explicit-secret"}, "env-secret", true, "explicit-secret", false},
 		{"explicit empty", []string{"-p", ""}, "env-secret", true, "", false},
+		{"literal unicode and whitespace", []string{"-p", "  p\täss🔑word\r\n  "}, "env-secret", true, "  p\täss🔑word\r\n  ", false},
+		{"explicit overrides invalid environment", []string{"-p", "explicit-secret"}, "invalid-\xff", true, "explicit-secret", false},
 		{"environment", nil, "env-secret", true, "env-secret", false},
 		{"environment empty", nil, "", true, "", false},
 		{"prompt", nil, "", false, "prompt-secret", true},
@@ -388,6 +391,75 @@ func TestCLIPasswordSourcesAndNoSecretOutput(t *testing.T) {
 			var results []Result
 			if err := json.Unmarshal(out.Bytes(), &results); err != nil || len(results) != 1 {
 				t.Fatalf("invalid JSON results: %v", err)
+			}
+		})
+	}
+}
+
+func TestCLIRejectsInvalidPasswordEncodingBeforeScanning(t *testing.T) {
+	const invalidPassword = "secret-\xff-must-not-appear"
+	for _, source := range []string{"argument", "environment", "prompt"} {
+		t.Run(source, func(t *testing.T) {
+			var out, diagnostics bytes.Buffer
+			deps := testCLIDeps(&out, &diagnostics)
+			deps.stderrIsTerminal = true
+			args := []string{"192.0.2.0/30", "-u", "alice", "--delay=0"}
+			if source == "argument" {
+				args = append(args, "-p", invalidPassword)
+			}
+			deps.lookupEnv = func(string) (string, bool) {
+				if source == "argument" {
+					t.Fatal("explicit password triggered an environment lookup")
+				}
+				return invalidPassword, source == "environment"
+			}
+			deps.prompt = func(context.Context, io.Reader, io.Writer) (string, error) {
+				if source != "prompt" {
+					t.Fatal("provided password triggered a prompt")
+				}
+				return invalidPassword, nil
+			}
+			scans := 0
+			deps.scan = func(context.Context, Target, Options) Result {
+				scans++
+				return Result{Authentication: "authenticated", Enumeration: "ok"}
+			}
+			code := runCLI(context.Background(), args, deps)
+			if code != 2 || scans != 0 || out.Len() != 0 || diagnostics.String() != "gosmb: password must be valid UTF-8\n" {
+				t.Fatalf("invalid password was not rejected before scan/output: exit=%d scans=%d stdout=%q stderr=%q", code, scans, out.String(), diagnostics.String())
+			}
+		})
+	}
+}
+
+func TestCLIPasswordCancellationPrecedesEncodingValidation(t *testing.T) {
+	for _, source := range []string{"environment", "prompt"} {
+		t.Run(source, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var out, diagnostics bytes.Buffer
+			deps := testCLIDeps(&out, &diagnostics)
+			deps.lookupEnv = func(string) (string, bool) {
+				if source == "environment" {
+					cancel()
+					return "invalid-\xff", true
+				}
+				return "", false
+			}
+			deps.prompt = func(context.Context, io.Reader, io.Writer) (string, error) {
+				if source != "prompt" {
+					t.Fatal("environment password triggered a prompt")
+				}
+				cancel()
+				return "invalid-\xff", nil
+			}
+			deps.scan = func(context.Context, Target, Options) Result {
+				t.Fatal("canceled password resolution started a scan")
+				return Result{}
+			}
+			code := runCLI(ctx, []string{"host", "-u", "alice"}, deps)
+			if code != 1 || out.Len() != 0 || diagnostics.String() != "gosmb: canceled\n" {
+				t.Fatalf("password validation took precedence over cancellation: exit=%d stdout=%q stderr=%q", code, out.String(), diagnostics.String())
 			}
 		})
 	}
@@ -442,6 +514,48 @@ func TestCLICancellationInterruptsDelay(t *testing.T) {
 	var results []Result
 	if err := json.Unmarshal(out.Bytes(), &results); err != nil || len(results) != 1 {
 		t.Fatalf("partial JSON invalid: %v", err)
+	}
+}
+
+func TestCLICancellationDuringFinalOutputReturnsFailure(t *testing.T) {
+	for _, phase := range []string{"JSON", "progress footer"} {
+		t.Run(phase, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var out, diagnostics bytes.Buffer
+			deps := testCLIDeps(&out, &diagnostics)
+			deps.scan = func(_ context.Context, target Target, _ Options) Result {
+				return Result{Target: target.String(), Authentication: "guest", Enumeration: "ok",
+					Shares: []ShareResult{{Name: "data", Read: Allowed, Write: Denied}}}
+			}
+			args := []string{"host", "--guest"}
+			if phase == "JSON" {
+				args = append(args, "--json", "--no-progress")
+				deps.stdout = outputWriteFunc(func(data []byte) (int, error) {
+					cancel()
+					return out.Write(data)
+				})
+			} else {
+				deps.stderrIsTerminal = true
+				deps.stderr = outputWriteFunc(func(data []byte) (int, error) {
+					if bytes.Contains(data, []byte("Progress:")) && bytes.HasSuffix(data, []byte{'\n'}) {
+						cancel()
+					}
+					return diagnostics.Write(data)
+				})
+			}
+			if code := runCLI(ctx, args, deps); ctx.Err() == nil || code != 1 {
+				t.Fatalf("cancellation during final output returned success: canceled=%v exit=%d", ctx.Err() != nil, code)
+			}
+			if phase == "JSON" {
+				var results []Result
+				if err := json.Unmarshal(out.Bytes(), &results); err != nil || len(results) != 1 || len(results[0].Shares) != 1 || results[0].Shares[0].Name != "data" {
+					t.Fatalf("late cancellation lost completed JSON results: %q, error=%v", out.String(), err)
+				}
+			} else if rows := parseTestTSV(t, out.String()); len(rows) != 2 || rows[1][1] != "data" {
+				t.Fatalf("late cancellation lost completed text results: %q", out.String())
+			}
+		})
 	}
 }
 
@@ -601,40 +715,57 @@ func TestGuestNeverLooksUpOrPromptsForCredentials(t *testing.T) {
 
 func TestGuestExitCodesRequireSuccessfulEnumeration(t *testing.T) {
 	for _, tt := range []struct {
-		name  string
-		guest bool
-		auth  string
-		enum  string
-		err   string
-		want  int
+		name      string
+		guest     bool
+		auth      string
+		enum      string
+		err       string
+		timedOut  bool
+		want      int
+		guestCell string
 	}{
-		{"explicit guest success", true, "guest", "ok", "", 0},
-		{"guest enumeration denied", true, "guest", "denied", "", 1},
-		{"guest incomplete scan", true, "guest", "ok", "canceled", 1},
-		{"guest auth failed", true, "failed", "not_attempted", "", 1},
-		{"anonymous is not guest", true, "anonymous", "ok", "", 1},
-		{"user auth is not explicit guest", true, "authenticated", "ok", "", 1},
-		{"server guest fallback accepted", false, "guest", "ok", "", 0},
-		{"server guest fallback enumeration denied", false, "guest", "denied", "", 1},
-		{"user anonymous fallback rejected", false, "anonymous", "ok", "", 1},
-		{"user auth unchanged", false, "authenticated", "ok", "", 0},
+		{"explicit guest success", true, "guest", "ok", "", false, 0, "N/A"},
+		{"guest enumeration denied", true, "guest", "denied", "", false, 1, "N/A"},
+		{"guest incomplete scan", true, "guest", "ok", "canceled", false, 1, "N/A"},
+		{"guest auth failed", true, "failed", "not_attempted", "", false, 1, "N/A"},
+		{"guest timeout before authentication", true, TimedOut, TimedOut, "", true, 1, "N/A"},
+		{"guest timeout after authentication", true, "guest", TimedOut, "", true, 1, "N/A"},
+		{"anonymous is not guest", true, "anonymous", "ok", "", false, 1, "N/A"},
+		{"user auth is not explicit guest", true, "authenticated", "ok", "", false, 1, "N/A"},
+		{"server guest fallback accepted", false, "guest", "ok", "", false, 0, "TRUE"},
+		{"server guest fallback enumeration denied", false, "guest", "denied", "", false, 1, "TRUE"},
+		{"user anonymous fallback rejected", false, "anonymous", "ok", "", false, 1, "FALSE"},
+		{"user auth unchanged", false, "authenticated", "ok", "", false, 0, "FALSE"},
 	} {
-		t.Run(tt.name, func(t *testing.T) {
-			var out, errOut bytes.Buffer
-			deps := testCLIDeps(&out, &errOut)
-			calls := 0
-			deps.scan = func(_ context.Context, target Target, _ Options) Result {
-				calls++
-				return Result{Target: target.String(), Reachable: true, Authentication: tt.auth, Enumeration: tt.enum, Error: tt.err, GuestFallback: tt.auth == "guest" && !tt.guest}
-			}
-			args := []string{"host", "--guest"}
-			if !tt.guest {
-				args = []string{"host", "-u", "alice", "-p", ""}
-			}
-			if code := runCLI(context.Background(), args, deps); code != tt.want || calls != 1 {
-				t.Fatalf("code=%d calls=%d, want code=%d and one call", code, calls, tt.want)
-			}
-		})
+		for _, format := range []struct {
+			name     string
+			terminal bool
+		}{{"TSV", false}, {"aligned", true}} {
+			t.Run(tt.name+"/"+format.name, func(t *testing.T) {
+				var out, errOut bytes.Buffer
+				deps := testCLIDeps(&out, &errOut)
+				deps.stdoutIsTerminal = format.terminal
+				calls := 0
+				deps.scan = func(_ context.Context, target Target, _ Options) Result {
+					calls++
+					return Result{Target: target.String(), Reachable: true, Authentication: tt.auth, Enumeration: tt.enum, Error: tt.err, TimedOut: tt.timedOut, GuestFallback: tt.auth == "guest" && !tt.guest}
+				}
+				args := []string{"host", "--guest", "--no-header"}
+				if !tt.guest {
+					args = []string{"host", "-u", "alice", "-p", "", "--no-header"}
+				}
+				if code := runCLI(context.Background(), args, deps); code != tt.want || calls != 1 {
+					t.Fatalf("code=%d calls=%d, want code=%d and one call", code, calls, tt.want)
+				}
+				columns := 6
+				if format.terminal {
+					columns = 7
+				}
+				if fields := strings.Fields(out.String()); len(fields) != columns || fields[4] != tt.guestCell {
+					t.Fatalf("guest column = %q; want %q", out.String(), tt.guestCell)
+				}
+			})
+		}
 	}
 }
 
@@ -644,10 +775,24 @@ func TestHelpExplainsColumnsAndAccessStatuses(t *testing.T) {
 	if code := runCLI(context.Background(), []string{"--help"}, deps); code != 0 {
 		t.Fatalf("help failed: %d", code)
 	}
-	for _, expected := range []string{"--guest", "Columns:", "TARGET_IP", "Supplied or connected IP plus port", "UNKNOWN:port if unavailable", "[IPv6]:port", "SHARE", "Share name", "READ", "Root listing permission", "WRITE", "Permission to add files at root", "metadata only; no write test", "GUEST", "TRUE when supplied credentials are accepted as Guest", "HOSTNAME", "Supplied hostname; - for literal IP targets (no reverse DNS)", "TRUE     Allowed", "FALSE    Denied", "UNKNOWN  Permission metadata missing/unsupported, or connection/login/access check failed", "TIMEOUT  Check timed out", "N/A      Not applicable"} {
+	for _, expected := range []string{"--guest", "Columns:", "TARGET_IP", "Supplied or connected IP plus port", "UNKNOWN:port if unavailable", "[IPv6]:port", "SHARE", "Share name", "READ", "Root listing permission", "WRITE", "Permission to add files at root", "metadata only; no write test", "GUEST", "TRUE when supplied credentials are accepted as Guest", "N/A when --guest is used", "HOSTNAME", "Supplied hostname; - for literal IP targets (no reverse DNS)", "TRUE     Allowed", "FALSE    Denied", "UNKNOWN  Permission metadata missing/unsupported, or connection/login/access check failed", "TIMEOUT  Check timed out", "N/A      Not applicable"} {
 		if !strings.Contains(out.String(), expected) {
 			t.Errorf("help missing output explanation %q", expected)
 		}
+	}
+	for _, expected := range []string{"STATUS", "Scan outcome in the interactive table only", "STATUS codes (interactive table):"} {
+		if !strings.Contains(out.String(), expected) {
+			t.Errorf("help missing interactive table explanation %q", expected)
+		}
+	}
+	for _, label := range statusLabels[1:] {
+		_, description, found := strings.Cut(out.String(), "\n  "+label+" ")
+		if !found || strings.TrimSpace(strings.SplitN(description, "\n", 2)[0]) == "" {
+			t.Errorf("help missing description for STATUS code %q", label)
+		}
+	}
+	if strings.Contains(out.String(), "Interactive column limits") || strings.Contains(out.String(), "TARGET_IP 47;") {
+		t.Error("help still includes the removed column-limits section")
 	}
 }
 
@@ -676,7 +821,7 @@ func TestServerGuestFallbackReportsActualSessionWithoutRetry(t *testing.T) {
 	}
 }
 
-func TestCLITerminalAlignsSixColumnsAcrossServers(t *testing.T) {
+func TestCLITerminalAlignsSevenColumnsAcrossServers(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hosts")
 	const longHost = "fileserver-with-a-hostname-longer-than-the-default-column.example.com"
 	if err := os.WriteFile(path, []byte("first\n[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535\n"+longHost+":1445\n"), 0600); err != nil {
@@ -688,23 +833,23 @@ func TestCLITerminalAlignsSixColumnsAcrossServers(t *testing.T) {
 		deps.stdoutIsTerminal = true
 		deps.scan = func(_ context.Context, target Target, _ Options) Result {
 			if target.Host == "first" {
-				return Result{Target: target.String(), ServerIP: "192.0.2.1", Reachable: true, Authentication: "authenticated", Enumeration: "ok", Shares: []ShareResult{{Name: "a", Read: Allowed, Write: Unknown}}}
+				return Result{Target: target.String(), ServerIP: "192.0.2.1", Reachable: true, Authentication: "authenticated", Enumeration: "ok", Shares: []ShareResult{{Name: "a", Accessible: Allowed, Read: Allowed, Write: Denied}}}
 			}
 			if target.Host == longHost {
-				return Result{Target: target.String(), ServerIP: "192.0.2.2", Reachable: true, Authentication: "authenticated", Enumeration: "ok", Shares: []ShareResult{{Name: "long-host-share", Read: Allowed, Write: Denied}}}
+				return Result{Target: target.String(), ServerIP: "192.0.2.2", Reachable: true, Authentication: "authenticated", Enumeration: "ok", Shares: []ShareResult{{Name: "long-host-share", Accessible: Allowed, Read: Allowed, Write: Denied}}}
 			}
-			return Result{Target: target.String(), ServerIP: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", Reachable: true, Authentication: "guest", GuestFallback: true, Enumeration: "ok", Shares: []ShareResult{{Name: "a longer shared folder", Read: Denied, Write: NotApplicable}}}
+			return Result{Target: target.String(), ServerIP: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", Reachable: true, Authentication: "guest", GuestFallback: true, Enumeration: "ok", Shares: []ShareResult{{Name: "a longer shared folder", Accessible: Denied, Read: Denied, Write: Denied}}}
 		}
 		args := []string{path, "-u", "alice", "-p", "", "--delay", "0"}
 		wantRows := [][]string{
-			{"192.0.2.1:445", "a", "TRUE", "UNKNOWN", "FALSE", "first"},
-			{"[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535", "a longer shared folder", "FALSE", "N/A", "TRUE", "-"},
-			{"192.0.2.2:1445", "long-host-share", "TRUE", "FALSE", "FALSE", longHost},
+			{"192.0.2.1:445", "a", "TRUE", "FALSE", "FALSE", "OK", "first"},
+			{"[ffff:ffff:ffff:ffff…", "a longer shared fol…", "FALSE", "FALSE", "TRUE", "OK", "-"},
+			{"192.0.2.2:1445", "long-host-share", "TRUE", "FALSE", "FALSE", "OK", longHost},
 		}
 		if noHeader {
 			args = append(args, "--no-header")
 		} else {
-			wantRows = append([][]string{{"TARGET_IP", "SHARE", "READ", "WRITE", "GUEST", "HOSTNAME"}}, wantRows...)
+			wantRows = append([][]string{{"TARGET_IP", "SHARE", "READ", "WRITE", "GUEST", "STATUS", "HOSTNAME"}}, wantRows...)
 		}
 		if code := runCLI(context.Background(), args, deps); code != 0 || errOut.Len() != 0 {
 			t.Fatalf("terminal output failed: code=%d stderr=%q", code, errOut.String())
@@ -716,19 +861,22 @@ func TestCLITerminalAlignsSixColumnsAcrossServers(t *testing.T) {
 		if len(lines) != len(wantRows) {
 			t.Fatalf("terminal output has missing/extra rows: %q", out.String())
 		}
-		starts := make([]int, 6)
+		starts := make([]int, 7)
 		for i, row := range wantRows {
 			cursor := 0
 			for column, value := range row {
 				offset := strings.Index(lines[i][cursor:], value)
 				if offset < 0 || strings.Trim(lines[i][cursor:cursor+offset], " ") != "" || (column > 0 && offset == 0) {
-					t.Fatalf("terminal row does not preserve six separated cells: %q", lines[i])
+					t.Fatalf("terminal row does not preserve seven separated cells: %q", lines[i])
 				}
 				start := cursor + offset
+				// This fixture uses ASCII plus the single-cell ellipsis. Count
+				// visible runes so its UTF-8 bytes do not look like shifted columns.
+				columnStart := utf8.RuneCountInString(lines[i][:start])
 				if i == 0 {
-					starts[column] = start
-				} else if starts[column] != start {
-					t.Fatalf("column %d starts at %d on first row but %d on row %d: %q", column, starts[column], start, i, out.String())
+					starts[column] = columnStart
+				} else if starts[column] != columnStart {
+					t.Fatalf("column %d starts at %d on first row but %d on row %d: %q", column, starts[column], columnStart, i, out.String())
 				}
 				cursor = start + len(value)
 			}
@@ -800,6 +948,65 @@ func TestCLIProducesOneTSVHeaderAndSendsDiagnosticsToStderr(t *testing.T) {
 			}
 			if strings.Contains(out.String()+errOut.String(), "do-not-leak-password") || strings.Contains(errOut.String(), "comments stay out") {
 				t.Fatal("secret or unused share comments appeared in output")
+			}
+		})
+	}
+}
+
+func TestCLIStatusColorPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name, flag, noColor, terminal string
+		tty, unsupported, wantColor   bool
+	}{
+		{name: "terminal", tty: true, wantColor: true},
+		{name: "redirected"},
+		{name: "forced TSV", flag: "--tsv", tty: true},
+		{name: "JSON", flag: "--json", tty: true},
+		{name: "NO_COLOR", tty: true, noColor: "1"},
+		{name: "dumb terminal", tty: true, terminal: "dumb"},
+		{name: "unsupported console", tty: true, unsupported: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, diagnostics bytes.Buffer
+			deps := testCLIDeps(&out, &diagnostics)
+			deps.stdoutIsTerminal = tc.tty
+			deps.lookupEnv = func(key string) (string, bool) {
+				switch key {
+				case "NO_COLOR":
+					return tc.noColor, tc.noColor != ""
+				case "TERM":
+					return tc.terminal, tc.terminal != ""
+				default:
+					t.Fatalf("unexpected environment lookup: %s", key)
+					return "", false
+				}
+			}
+			prepared, restored := false, false
+			deps.enableColor = func() (func(), bool) {
+				prepared = true
+				return func() { restored = true }, !tc.unsupported
+			}
+			deps.scan = func(_ context.Context, target Target, _ Options) Result {
+				return Result{Target: target.String(), Authentication: "authenticated", Enumeration: "ok",
+					Shares: []ShareResult{{Name: "data", Read: Allowed, Write: Denied}}}
+			}
+			args := []string{"host", "-u", "alice", "-p", ""}
+			if tc.flag != "" {
+				args = append(args, tc.flag)
+			}
+			if code := runCLI(context.Background(), args, deps); code != 0 {
+				t.Fatalf("scan failed: exit=%d stderr=%q", code, diagnostics.String())
+			}
+			if tc.wantColor {
+				if !strings.Contains(out.String(), "\x1b[32mTRUE\x1b[0m") || strings.Count(out.String(), "\x1b[31mFALSE\x1b[0m") != 2 {
+					t.Fatalf("terminal statuses were not colored: %q", out.String())
+				}
+			} else if strings.ContainsRune(out.String(), '\x1b') {
+				t.Fatalf("color leaked into plain output: %q", out.String())
+			}
+			wantPrepare := tc.wantColor || tc.unsupported
+			if prepared != wantPrepare || restored != prepared {
+				t.Fatalf("unexpected terminal lifecycle: prepared=%t restored=%t", prepared, restored)
 			}
 		})
 	}
