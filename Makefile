@@ -1,10 +1,13 @@
-.PHONY: all build test vet test-interop
+.PHONY: all build build-all test vet test-interop
 
 all: build
 
 # No C runtime or installed SMB libraries are needed by the resulting binary.
 build:
 	CGO_ENABLED=0 go build -trimpath -o gosmb .
+
+build-all:
+	./build.sh
 
 test:
 	go test -race ./...
