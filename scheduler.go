@@ -15,11 +15,7 @@ type hostScanOutcome struct {
 // Each host gets its own deadline when its scan starts, not while queued.
 // A host deadline completes that attempt; cancellation of the whole run does not.
 func runHostScan(ctx context.Context, target Target, opts Options, scan func(context.Context, Target, Options) Result) hostScanOutcome {
-	hostCtx := ctx
-	cancel := func() {}
-	if opts.HostTimeout > 0 {
-		hostCtx, cancel = context.WithTimeout(ctx, opts.HostTimeout)
-	}
+	hostCtx, cancel := withHostTimeout(ctx, opts.HostTimeout)
 	defer cancel()
 	result := scan(hostCtx, target, opts)
 	completed := ctx.Err() == nil

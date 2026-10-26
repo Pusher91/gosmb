@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -20,14 +21,11 @@ import (
 const maxTargets = 65536
 
 func parsePort(value string) (int, error) {
-	if value == "" || strings.IndexFunc(value, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+	n, err := strconv.ParseUint(value, 10, 16)
+	if err != nil || n == 0 {
 		return 0, errors.New("invalid port")
 	}
-	n, err := strconv.Atoi(value)
-	if err != nil || n < 1 || n > 65535 {
-		return 0, errors.New("invalid port")
-	}
-	return n, nil
+	return int(n), nil
 }
 
 func parseTarget(raw string) (Target, error) {
@@ -36,29 +34,11 @@ func parseTarget(raw string) (Target, error) {
 		return Target{}, bad
 	}
 	host, port := raw, 445
-	if strings.HasPrefix(raw, "[") {
-		if strings.HasSuffix(raw, "]") {
-			host = raw[1 : len(raw)-1]
-		} else {
-			var portString string
-			var err error
-			host, portString, err = net.SplitHostPort(raw)
-			if err != nil {
-				return Target{}, bad
-			}
-			port, err = parsePort(portString)
-			if err != nil {
-				return Target{}, bad
-			}
-		}
-		addr, err := netip.ParseAddr(host)
-		if err != nil || !addr.Is6() {
-			return Target{}, bad
-		}
-		host = addr.String()
-	} else if addr, err := netip.ParseAddr(raw); err == nil {
-		host = addr.String()
-	} else if strings.Contains(raw, ":") {
+	bracketed := strings.HasPrefix(raw, "[")
+	if bracketed && strings.HasSuffix(raw, "]") {
+		host = raw[1 : len(raw)-1]
+	} else if bracketed || strings.Count(raw, ":") == 1 {
+		// Multiple unbracketed colons belong to a bare IPv6 address.
 		var portString string
 		var err error
 		host, portString, err = net.SplitHostPort(raw)
@@ -70,7 +50,11 @@ func parseTarget(raw string) (Target, error) {
 			return Target{}, bad
 		}
 	}
-	if addr, err := netip.ParseAddr(host); err == nil {
+	addr, err := netip.ParseAddr(host)
+	if bracketed && (err != nil || !addr.Is6()) {
+		return Target{}, bad
+	}
+	if err == nil {
 		if zone := addr.Zone(); zone != "" && strings.IndexFunc(zone, func(r rune) bool {
 			return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_.-", r))
 		}) >= 0 {
@@ -87,7 +71,7 @@ func parseTarget(raw string) (Target, error) {
 		if strings.Contains(labels, ".") && strings.IndexFunc(labels, func(r rune) bool { return r != '.' && (r < '0' || r > '9') }) == -1 {
 			return Target{}, bad
 		}
-		for _, label := range strings.Split(labels, ".") {
+		for label := range strings.SplitSeq(labels, ".") {
 			if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
 				return Target{}, bad
 			}
@@ -96,6 +80,10 @@ func parseTarget(raw string) (Target, error) {
 					return Target{}, bad
 				}
 			}
+		}
+		if len(host) < len(raw) {
+			// Keep only the hostname, not the backing text of a long zero-padded port.
+			host = strings.Clone(host)
 		}
 	}
 	return Target{Host: host, Port: port}, nil
@@ -140,18 +128,20 @@ func parseTargetList(ctx context.Context, r io.Reader) ([]Target, error) {
 			return nil, err
 		}
 		lineNumber++
-		line := scanner.Text()
+		line := scanner.Bytes()
 		if lineNumber == 1 {
-			line = strings.TrimPrefix(line, "\ufeff")
+			line = bytes.TrimPrefix(line, []byte("\ufeff"))
 		}
-		if !utf8.ValidString(line) {
+		if !utf8.Valid(line) {
 			return nil, fmt.Errorf("host-list line %d is not valid UTF-8", lineNumber)
 		}
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || line[0] == '#' {
 			continue
 		}
-		expanded, err := parseTargetSpec(line)
+		// Own only the trimmed target text: retained hostnames must neither
+		// alias the scanner buffer nor keep an entire padded line alive.
+		expanded, err := parseTargetSpec(string(line))
 		if err != nil {
 			return nil, fmt.Errorf("invalid target at host-list line %d: %w", lineNumber, err)
 		}
@@ -224,11 +214,10 @@ func parseTargetSpec(raw string) ([]Target, error) {
 	if hostBits > 16 {
 		return nil, fmt.Errorf("CIDR range exceeds the limit of %d addresses", maxTargets)
 	}
-	count := 1 << hostBits
-	targets := make([]Target, 0, count)
+	targets := make([]Target, 1<<hostBits)
 	address := prefix.Masked().Addr()
-	for range count {
-		targets = append(targets, Target{Host: address.String(), Port: port})
+	for i := range targets {
+		targets[i] = Target{Host: address.String(), Port: port}
 		address = address.Next()
 	}
 	return targets, nil
@@ -241,12 +230,13 @@ func appendUniqueTargets(targets []Target, seen map[Target]struct{}, added []Tar
 	for _, target := range added {
 		endpoint := target
 		if addr, err := netip.ParseAddr(target.Host); err == nil {
-			// IPv4 and its unscoped mapped spelling dial the same endpoint.
+			// IPv4 and its mapped spellings dial the same endpoint. The dialer
+			// ignores zones on mapped IPv4 addresses, even nonexistent zones.
 			// Normalize only the key so output retains the first supplied form.
-			if addr.Is4In6() && addr.Zone() == "" {
+			if addr.Is4In6() {
 				endpoint.Host = addr.Unmap().String()
 			}
-			// IPv6 zone identifiers name local interfaces and are case-sensitive.
+			// Native IPv6 zones name local interfaces and are case-sensitive.
 			// Retain them exactly to keep distinct interfaces separate.
 		} else {
 			endpoint.Host = strings.ToLower(target.Host)

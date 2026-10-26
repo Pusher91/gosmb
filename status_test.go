@@ -121,24 +121,26 @@ func TestTableStatusScopeAndSerializedSchema(t *testing.T) {
 			t.Errorf("share %q status = %q; want %q", result.Shares[i].Name, got, want)
 		}
 	}
-	result.status = statusEnumPartial
+	result.status, result.completionStatus = statusEnumPartial, statusScanTimeout
 	for i := range result.Shares {
 		if got := tableStatus(result, &result.Shares[i]); got != "ENUM_PARTIAL" {
 			t.Errorf("partial enumeration did not affect every row: %q", got)
 		}
 	}
-	result.status, result.cleanupStatus = statusOK, statusCleanupTimeout
-	if got := tableStatus(result, &result.Shares[0]); got != "CLEANUP_TIMEOUT" {
-		t.Errorf("completed row lost host cleanup timeout: %q", got)
-	}
-	if got := tableStatus(result, &result.Shares[1]); got != "CHECK_FAILED" {
-		t.Errorf("cleanup erased primary share failure: %q", got)
+	for _, completion := range []scanStatus{statusCleanupTimeout, statusScanTimeout} {
+		result.status, result.completionStatus = statusOK, completion
+		if got := tableStatus(result, &result.Shares[0]); got != statusLabels[completion] {
+			t.Errorf("completed row lost host completion outcome: %q", got)
+		}
+		if got := tableStatus(result, &result.Shares[1]); got != "CHECK_FAILED" {
+			t.Errorf("completion outcome erased primary share failure: %q", got)
+		}
 	}
 	withStatus, err := json.Marshal(result)
 	if err != nil {
 		t.Fatal(err)
 	}
-	result.status, result.cleanupStatus = statusUnset, statusUnset
+	result.status, result.completionStatus = statusUnset, statusUnset
 	for i := range result.Shares {
 		result.Shares[i].status = statusUnset
 	}
@@ -275,7 +277,7 @@ func TestPoisonedShareConnectionDoesNotChangeOtherRowStatuses(t *testing.T) {
 	default:
 		t.Fatalf("did not reach disk TREE_CONNECT response: %+v", result)
 	}
-	if len(result.Shares) != 3 || result.cleanupStatus != statusUnset {
+	if len(result.Shares) != 3 || result.completionStatus != statusUnset {
 		t.Fatalf("failed share connection became a host cleanup failure: %+v", result)
 	}
 	for _, share := range result.Shares {

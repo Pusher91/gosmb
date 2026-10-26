@@ -57,7 +57,7 @@ func TestScanTargetExplainsAuthenticationRejections(t *testing.T) {
 	}
 }
 
-func TestAuthenticationFailureReasonRequiresRecognizedSessionStatus(t *testing.T) {
+func TestAuthenticationFailureRequiresRecognizedSessionStatus(t *testing.T) {
 	for _, err := range []error{
 		nil,
 		errors.New("connection refused"),
@@ -65,13 +65,13 @@ func TestAuthenticationFailureReasonRequiresRecognizedSessionStatus(t *testing.T
 		&smb.NTStatusError{Command: 3, Status: smb.StatusAccessDenied},
 		&smb.NTStatusError{Command: smb.SessionSetupCommand, Status: smb.StatusNotSupported},
 	} {
-		if reason := authenticationFailureReason(err); reason != "" {
-			t.Errorf("non-authentication rejection %v became %q", err, reason)
+		if status, reason := authenticationFailure(err); status != statusUnset || reason != "" {
+			t.Errorf("non-authentication rejection %v became %d, %q", err, status, reason)
 		}
 	}
 	err := fmt.Errorf("session setup: %w", &smb.NTStatusError{Command: smb.SessionSetupCommand, Status: smb.StatusLogonFailure})
-	if reason := authenticationFailureReason(err); reason != "username or password was rejected" {
-		t.Errorf("wrapped authentication reason = %q", reason)
+	if status, reason := authenticationFailure(err); status != statusAuthFailed || reason != "username or password was rejected" {
+		t.Errorf("wrapped authentication failure = %d, %q", status, reason)
 	}
 }
 

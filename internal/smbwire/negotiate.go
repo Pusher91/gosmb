@@ -42,8 +42,7 @@ func (c *Connection) validateNegotiateInfo(treeID uint32) error {
 	body = append(body, c.clientNegotiateInfo...)
 	r, err := c.exchange(smb2IOCTL, treeID, body)
 	if err != nil {
-		var status *NTStatusError
-		if errors.As(err, &status) {
+		if status, ok := errors.AsType[*NTStatusError](err); ok {
 			// SMB2-only servers may not implement this control. Accept only
 			// authenticated unsupported outcomes documented by MS-SMB2
 			// 3.3.5.15 (including its Windows behavior note 382). Our policy

@@ -39,6 +39,16 @@ func TestTerminalColorRestoresConsoleMode(t *testing.T) {
 	if err := windows.GetConsoleMode(handle, &got); err != nil || got != baseline|colorModes {
 		t.Fatalf("enabled console mode = %#x, error %v; want %#x", got, err, baseline|colorModes)
 	}
+	// stdout and stderr can refer to this same buffer. Restoring the second
+	// preparation must keep the first preparation's processing flags active.
+	restoreSecond, enabledSecond := enableTerminalColor(raw)
+	if !enabledSecond {
+		t.Fatal("already prepared console did not remain enabled")
+	}
+	restoreSecond()
+	if err := windows.GetConsoleMode(handle, &got); err != nil || got != baseline|colorModes {
+		t.Fatalf("second restore changed shared console mode = %#x, error %v", got, err)
+	}
 	restore()
 	if err := windows.GetConsoleMode(handle, &got); err != nil || got != baseline {
 		t.Fatalf("restored console mode = %#x, error %v; want %#x", got, err, baseline)

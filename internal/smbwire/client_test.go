@@ -255,8 +255,8 @@ func TestCleanupResponsesRejectMalformedBodiesAndCloseTransport(t *testing.T) {
 				c, wire := connectionWithResponse(operation.command, operation.treeID, 0, response.body)
 				err := operation.call(c)
 				wantClosed := !response.good || operation.command == 2
-				if (err == nil) != response.good || wire.closed != wantClosed {
-					t.Fatalf("cleanup result err=%v, closed=%v, valid=%v", err, wire.closed, response.good)
+				if (err == nil) != response.good || wire.closed != wantClosed || c.IsClosed() != wantClosed {
+					t.Fatalf("cleanup result err=%v, transport closed=%v, client closed=%v, valid=%v", err, wire.closed, c.IsClosed(), response.good)
 				}
 			})
 		}
@@ -319,6 +319,9 @@ func TestConnectionTerminationInvalidatesSessionAndHandles(t *testing.T) {
 				body, status = []byte{9, 0, 0, 0, 0, 0, 0, 0}, StatusAccessDenied
 			}
 			c, wire := connectionWithResponse(2, 0, status, body)
+			if c.IsClosed() {
+				t.Fatal("active session reported closed before termination")
+			}
 			c.maxRead, c.maxWrite = 65536, 65536
 			c.trees["share"].kind = 2
 			pipe := &File{c: c, tree: c.trees["share"], pipe: true}
@@ -358,8 +361,8 @@ func TestConnectionTerminationInvalidatesSessionAndHandles(t *testing.T) {
 			if err := c.TreeConnect("new-share"); !errors.Is(err, net.ErrClosed) {
 				t.Fatalf("terminated session reused: %v", err)
 			}
-			if _, known := c.TreeMaximalAccess("share"); known || c.AuthResult() != AuthResultUnverified {
-				t.Fatal("closed session still exposed active authorization state")
+			if _, known := c.TreeMaximalAccess("share"); known || c.AuthResult() != AuthResultUnverified || !c.IsClosed() {
+				t.Fatal("terminated session still reported active state")
 			}
 			if err := c.Logoff(); !errors.Is(err, net.ErrClosed) {
 				t.Fatalf("repeated logoff lost closed-transport diagnostic: %v", err)
@@ -833,33 +836,59 @@ func FuzzSPNEGOResponse(f *testing.F) {
 }
 
 func TestRootRequestReadOnlyWireLayout(t *testing.T) {
-	body, err := rootRequest(1, true)
+	// Independent wire fixture for LIST without MxAc, including all reserved
+	// bytes and padding. Offsets include the separate 64-byte SMB header.
+	base, err := hex.DecodeString(strings.Join([]string{
+		"3900000002000000", "0000000000000000", "0000000000000000", "0100000000000000",
+		"0700000001000000", "0100000078000000", "0000000000000000", "0000000000000000",
+	}, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Decode offsets independently of the production encoder. Offsets on
-	// the wire are relative to the 64-byte SMB header.
-	if len(body) != 88 || binary.LittleEndian.Uint16(body) != 57 ||
-		binary.LittleEndian.Uint32(body[24:]) != 1 ||
-		binary.LittleEndian.Uint32(body[32:]) != 7 ||
-		binary.LittleEndian.Uint32(body[36:]) != 1 ||
-		binary.LittleEndian.Uint32(body[40:]) != 1 {
-		t.Fatalf("unexpected existing-root access request: %x", body)
+	context, err := hex.DecodeString("000000001000040000000000000000004d78416300000000")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if binary.LittleEndian.Uint16(body[44:]) != 120 || binary.LittleEndian.Uint16(body[46:]) != 0 ||
-		binary.LittleEndian.Uint32(body[48:]) != 128 || binary.LittleEndian.Uint32(body[52:]) != 24 {
-		t.Fatal("incorrect root name or context offsets")
-	}
-	ctx := body[64:]
-	if string(ctx[16:20]) != "MxAc" || binary.LittleEndian.Uint32(ctx[:4]) != 0 || binary.LittleEndian.Uint32(ctx[12:]) != 0 {
-		t.Fatal("expected one maximal-access context without a timestamp")
+	for _, tc := range []struct {
+		name    string
+		desired uint32
+		maximal bool
+	}{
+		{"list", 1, false},
+		{"list with metadata", 1, true},
+		{"attributes", 0x80, false},
+		{"attributes with metadata", 0x80, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := append([]byte(nil), base...)
+			want[24] = byte(tc.desired)
+			if tc.maximal {
+				want[48], want[52] = 128, 24
+				want = append(want, context...)
+			}
+			body, err := rootRequest(tc.desired, tc.maximal)
+			if err != nil || !bytes.Equal(body, want) {
+				t.Fatalf("root request = %x, %v; want %x", body, err, want)
+			}
+		})
 	}
 }
 
 func TestRootRequestRejectsWriteAndDeleteAccess(t *testing.T) {
 	for _, access := range []uint32{0, 2, 4, 0x10000, 0x10000000, 0x001f01ff, 0x81} {
-		if _, err := rootRequest(access, true); err == nil {
-			t.Fatalf("accepted access %#x", access)
+		for _, maximal := range []bool{false, true} {
+			if _, err := rootRequest(access, maximal); err == nil {
+				t.Fatalf("accepted access %#x with maximal=%t", access, maximal)
+			}
+		}
+	}
+}
+
+func BenchmarkRootRequest(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := rootRequest(FileListDirectory, true); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

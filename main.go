@@ -21,6 +21,9 @@ func main() {
 		enableColor: func() (func(), bool) {
 			return enableTerminalColor(os.Stdout.Fd())
 		},
+		enableProgress: func() (func(), bool) {
+			return enableTerminalColor(os.Stderr.Fd())
+		},
 		lookupEnv: os.LookupEnv, prompt: promptPassword, scan: scanTarget,
 	})
 	stop()

@@ -17,8 +17,12 @@ import (
 )
 
 // displayText escapes terminal controls before optional truncation. A negative
-// limit preserves the full value. Truncation never splits runes or escapes.
+// limit preserves the full value; otherwise the rune limit includes any
+// ellipsis. Truncation never splits runes or escapes.
 func displayText(s string, limit int) string {
+	if limit == 0 {
+		return ""
+	}
 	// Ordinary output cells need no copy. Most share names and every fixed
 	// permission cell take this path; escaping still handles all Unicode controls.
 	if (limit < 0 || utf8.RuneCountInString(s) <= limit) && utf8.ValidString(s) && strings.IndexFunc(s, needsDisplayEscape) < 0 {
@@ -33,7 +37,9 @@ func displayText(s string, limit int) string {
 	var escape [10]byte // Longest escape: \U followed by eight hexadecimal digits.
 	escape[0] = '\\'
 	count := 0
-	for _, r := range s {
+	for len(s) > 0 {
+		r, size := utf8.DecodeRuneInString(s)
+		s = s[size:]
 		width := 1
 		switch r {
 		case '\n':
@@ -58,9 +64,15 @@ func displayText(s string, limit int) string {
 				}
 			}
 		}
-		if limit >= 0 && width > limit-count {
-			b.WriteRune('…')
-			break
+		if limit >= 0 {
+			remaining := limit - count
+			if len(s) > 0 {
+				remaining-- // Reserve the ellipsis until the final rune fits.
+			}
+			if width > remaining {
+				b.WriteRune('…')
+				break
+			}
 		}
 		if width == 1 {
 			b.WriteRune(r)
@@ -106,8 +118,20 @@ func redactResult(r Result, password string) Result {
 	// redaction changes a field, preserving caller ownership in either case.
 	copied := false
 	for i, s := range r.Shares {
-		s.Name, s.Type, s.Comment = redact(s.Name), redact(s.Type), redact(s.Comment)
-		s.WriteBasis, s.Error = redact(s.WriteBasis), redact(s.Error)
+		s.Name, s.Comment, s.Error = redact(s.Name), redact(s.Comment), redact(s.Error)
+		// These exact values are generated locally, never copied from server
+		// text. A coincidentally matching password must not corrupt their JSON
+		// meaning. Unrecognized values still receive defensive redaction.
+		switch s.Type {
+		case "disk", "printer", "device", "ipc", "other":
+		default:
+			s.Type = redact(s.Type)
+		}
+		switch s.WriteBasis {
+		case "share_and_root_metadata", "share_metadata", "root_metadata", "unavailable", "not_a_disk_share", "share_connection_denied":
+		default:
+			s.WriteBasis = redact(s.WriteBasis)
+		}
 		if s != r.Shares[i] {
 			if !copied {
 				r.Shares = append([]ShareResult(nil), r.Shares...)
@@ -224,8 +248,8 @@ func textResultRows(r Result) iter.Seq[[6]string] {
 		}
 		for _, share := range r.Shares {
 			fields[1] = tsvCell(share.Name)
-			fields[2] = tsvCell(displayPermission(share.Read))
-			fields[3] = tsvCell(displayPermission(share.Write))
+			fields[2] = displayPermission(share.Read)
+			fields[3] = displayPermission(share.Write)
 			if !yield(fields) {
 				return
 			}
@@ -242,6 +266,7 @@ func writeAlignedHeader(out io.Writer) error {
 }
 
 func writeAlignedResult(out io.Writer, result Result, colored bool) error {
+	b := lineOutputBuffer{out: out}
 	i := 0
 	for row := range textResultRows(result) {
 		var share *ShareResult
@@ -249,39 +274,66 @@ func writeAlignedResult(out io.Writer, result Result, colored bool) error {
 			share = &result.Shares[i]
 		}
 		fields := [7]string{row[0], row[1], row[2], row[3], row[4], tableStatus(result, share), row[5]}
-		if err := writeAlignedRow(out, fields, colored); err != nil {
+		if err := appendAlignedRow(&b, fields, colored); err != nil {
 			return err
 		}
 		i++
 	}
-	return nil
+	return b.flush()
 }
 
 // alignedCell clips already escaped text by terminal width, reserving room for
 // the ellipsis. Grapheme clusters and display escapes remain whole. TSV and
 // JSON deliberately retain complete values for machine consumers.
 func alignedCell(value string, limit int) (string, int) {
-	value = displayText(value, -1)
-	width := uniseg.StringWidth(value)
-	if limit == 0 || width <= limit {
-		return value, width
-	}
-	end, used, state := 0, 0, -1
-	for remaining := value; remaining != ""; {
-		var unit string
-		var unitWidth int
-		if n := displayEscapeLen(remaining); n > 0 {
-			unit, remaining, unitWidth, state = remaining[:n], remaining[n:], n, -1
-		} else {
-			unit, remaining, unitWidth, state = uniseg.FirstGraphemeClusterInString(remaining, state)
-		}
-		if used+unitWidth > limit-1 {
+	// Printable ASCII has one terminal cell per byte. It needs no escaping or
+	// grapheme analysis; clipped backslash sequences still use the safe path.
+	ascii, backslash := true, false
+	for i := 0; i < len(value); i++ {
+		if value[i] < ' ' || value[i] >= 0x7f {
+			ascii = false
 			break
 		}
-		end += len(unit)
-		used += unitWidth
+		backslash = backslash || value[i] == '\\'
 	}
-	return value[:end] + "…", used + 1
+	if ascii {
+		if limit == 0 || len(value) <= limit {
+			return value, len(value)
+		}
+		if limit > 0 && !backslash {
+			return value[:limit-1] + "…", limit
+		}
+	}
+	value = displayText(value, -1)
+	if limit == 0 {
+		return value, uniseg.StringWidth(value)
+	}
+	// Keep a prefix with room for an ellipsis while allowing exact fits.
+	// Once the value overflows, the remaining graphemes need no width scan.
+	used, clipEnd, clipWidth, state := 0, 0, 0, -1
+	for remaining := value; remaining != ""; {
+		start := remaining
+		var unit string
+		var unitWidth int
+		unit, remaining, unitWidth, state = uniseg.FirstGraphemeClusterInString(remaining, state)
+		// Some characters join an escape's backslash; following marks can
+		// join its last character. Keep both graphemes and the escape whole.
+		if unit[len(unit)-1] == '\\' {
+			if n := displayEscapeLen(start[len(unit)-1:]); n > 0 {
+				var lastWidth int
+				_, remaining, lastWidth, state = uniseg.FirstGraphemeClusterInString(start[len(unit)+n-2:], -1)
+				unitWidth += n - 2 + lastWidth
+			}
+		}
+		if used+unitWidth > limit {
+			return value[:clipEnd] + "…", clipWidth + 1
+		}
+		used += unitWidth
+		if used <= limit-1 {
+			clipEnd, clipWidth = len(value)-len(remaining), used
+		}
+	}
+	return value, used
 }
 
 // The input was escaped by tsvCell/displayText. Recognizing those tokens keeps
@@ -315,6 +367,14 @@ func displayEscapeLen(value string) int {
 }
 
 func writeAlignedRow(out io.Writer, fields [7]string, colored bool) error {
+	b := lineOutputBuffer{out: out}
+	if err := appendAlignedRow(&b, fields, colored); err != nil {
+		return err
+	}
+	return b.flush()
+}
+
+func appendAlignedRow(b *lineOutputBuffer, fields [7]string, colored bool) error {
 	const reset = "\x1b[0m"
 	var padding [7]int
 	var colors [7]string
@@ -340,7 +400,6 @@ func writeAlignedRow(out io.Writer, fields [7]string, colored bool) error {
 			}
 		}
 	}
-	var b strings.Builder
 	b.Grow(size)
 	for i, value := range fields {
 		b.WriteString(colors[i])
@@ -350,9 +409,7 @@ func writeAlignedRow(out io.Writer, fields [7]string, colored bool) error {
 		}
 		b.WriteString(strings.Repeat(" ", padding[i]))
 	}
-	b.WriteByte('\n')
-	_, err := writeOutputString(out, b.String())
-	return err
+	return b.endLine()
 }
 
 // TSV status explanations go to stderr, leaving stdout as a stable data stream.
@@ -383,6 +440,7 @@ func writeTextDiagnostics(out io.Writer, r Result) error {
 	return b.flush()
 }
 
+// displayPermission returns an escaped text cell; fixed labels need no escaping.
 func displayPermission(value string) string {
 	switch value {
 	case Allowed:
@@ -396,7 +454,7 @@ func displayPermission(value string) string {
 	case TimedOut:
 		return "TIMEOUT"
 	}
-	return value
+	return tsvCell(value)
 }
 
 func writeJSONResults(out io.Writer, results []Result) error {

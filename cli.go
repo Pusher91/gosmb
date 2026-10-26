@@ -13,7 +13,7 @@ import (
 	"unicode/utf8"
 )
 
-const usage = `gosmb - Read-only SMB share permission checker
+const usageIntro = `gosmb - Read-only SMB share permission checker
 
 Usage:
   gosmb <server|CIDR|servers.txt> -u USER [-p PASSWORD] [options]
@@ -58,36 +58,9 @@ READ/WRITE statuses (text output):
   N/A      Not applicable (non-disk share)
 
 STATUS codes (interactive table):
-  OK                  Check completed; READ/WRITE show the permissions
-  NO_SHARES           Share enumeration completed but returned no shares
-  DNS_FAILED          Hostname lookup failed
-  CONNECT_FAILED      Could not establish a TCP connection
-  CONNECT_REFUSED     TCP connection was refused
-  CONNECT_TIMEOUT     TCP connection timed out
-  NEGOTIATE_FAILED    Server rejected SMB negotiation
-  SMB_FAILED          SMB connection or protocol exchange failed
-  SMB_TIMEOUT         SMB negotiation or session setup timed out
-  AUTH_FAILED         Server rejected the login
-  ACCOUNT_LOCKED      Account is locked out
-  ACCOUNT_DISABLED    Account is disabled
-  ACCOUNT_EXPIRED     Account has expired
-  ACCOUNT_RESTRICTED  Account restrictions prevented logon
-  PASSWORD_EXPIRED    Password has expired
-  PASSWORD_CHANGE     Password must be changed before logon
-  LOGON_HOURS         Logon is not allowed at this time
-  WORKSTATION_DENIED  Logon is not allowed from this workstation
-  AUTH_UNVERIFIED     Session was anonymous or its identity could not be verified
-  GUEST_MISMATCH      Server did not establish a Guest session for --guest
-  ENUM_DENIED         Access to the share list was denied
-  ENUM_FAILED         Could not retrieve the share list
-  ENUM_PARTIAL        Share list is incomplete; discovered shares are shown
-  ENUM_TIMEOUT        Retrieving the share list timed out
-  CHECK_FAILED        Permission check failed or required metadata was unavailable
-  CHECK_TIMEOUT       Share permission check timed out
-  CLEANUP_FAILED      Closing a handle, share connection, or session failed
-  CLEANUP_TIMEOUT     Closing a handle, share connection, or session timed out
-  CANCELED            Scan was canceled
 `
+
+var usage = usageIntro + statusHelp()
 
 type cliConfig struct {
 	options     Options
@@ -109,6 +82,7 @@ type cliDependencies struct {
 	stdoutIsTerminal bool
 	stderrIsTerminal bool
 	enableColor      func() (restore func(), enabled bool)
+	enableProgress   func() (restore func(), enabled bool)
 	lookupEnv        func(string) (string, bool)
 	prompt           func(context.Context, io.Reader, io.Writer) (string, error)
 	scan             func(context.Context, Target, Options) Result
@@ -388,10 +362,15 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 	}
 	aligned := deps.stdoutIsTerminal && !cfg.tsv && !cfg.json
 	colored := aligned && deps.enableColor != nil
-	if colored && deps.lookupEnv != nil {
-		noColor, _ := deps.lookupEnv("NO_COLOR")
+	showProgress := deps.stderrIsTerminal && !cfg.noProgress
+	if (colored || showProgress) && deps.lookupEnv != nil {
 		terminal, _ := deps.lookupEnv("TERM")
-		colored = noColor == "" && terminal != "dumb"
+		if terminal == "dumb" {
+			colored, showProgress = false, false
+		} else if colored {
+			noColor, _ := deps.lookupEnv("NO_COLOR")
+			colored = noColor == ""
+		}
 	}
 	if colored {
 		var restore func()
@@ -416,8 +395,17 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 			return 1
 		}
 	}
+	if showProgress && deps.enableProgress != nil {
+		var restore func()
+		restore, showProgress = deps.enableProgress()
+		if restore != nil {
+			// Finish the footer before restoring stderr, then restore stdout.
+			// The handles may refer to the same Windows console buffer.
+			defer restore()
+		}
+	}
 	completed := 0
-	progress := newProgress(deps.stderr, deps.stderrIsTerminal && !cfg.noProgress, len(cfg.targets))
+	progress := newProgress(deps.stderr, showProgress, len(cfg.targets))
 	defer func() {
 		if err := progress.Finish(completed, ctx.Err() != nil); err != nil || ctx.Err() != nil {
 			code = 1
@@ -426,7 +414,24 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 	if err := progress.Update(completed); err != nil {
 		return 1
 	}
-	scanErr := scanTargets(ctx, cfg.targets, cfg.options, cfg.concurrency, cfg.delay, deps.scan, func(result Result, hostCompleted bool) error {
+	scanCtx := ctx
+	var stopScan context.CancelFunc
+	if cfg.json && showProgress {
+		scanCtx, stopScan = context.WithCancel(ctx)
+		defer stopScan()
+	}
+	progressFailed := false
+	handleProgressError := func(err error) error {
+		if err == nil || stopScan == nil {
+			return err
+		}
+		// Stop new work but keep collecting active and buffered JSON results.
+		// Returning an emitter error would make the scheduler discard them.
+		progressFailed, code = true, 1
+		stopScan()
+		return nil
+	}
+	scanErr := scanTargets(scanCtx, cfg.targets, cfg.options, cfg.concurrency, cfg.delay, deps.scan, func(result Result, hostCompleted bool) error {
 		result.explicitGuest = cfg.options.Guest
 		if hostCompleted {
 			completed++
@@ -441,12 +446,17 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 			code = 1
 		}
 		result = redactResult(result, cfg.options.Password)
-		if err := progress.Clear(); err != nil {
-			return err
-		}
 		if cfg.json {
+			// Keep completed work even if the separate progress stream fails.
 			results = append(results, result)
-		} else {
+			if progressFailed {
+				return nil
+			}
+		}
+		if err := progress.Clear(); err != nil {
+			return handleProgressError(err)
+		}
+		if !cfg.json {
 			if err := writeResult(deps.stdout, result); err != nil {
 				fmt.Fprintln(deps.stderr, "gosmb: could not write output")
 				return err
@@ -457,20 +467,19 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 				}
 			}
 		}
-		return progress.Update(completed)
+		return handleProgressError(progress.Update(completed))
 	})
 	if scanErr != nil {
 		code = 1
 		if ctx.Err() != nil {
-			if err := progress.Clear(); err != nil {
-				return 1
+			if err := progress.Clear(); err == nil {
+				fmt.Fprintln(deps.stderr, "gosmb: canceled")
 			}
-			fmt.Fprintln(deps.stderr, "gosmb: canceled")
 		}
 	}
 	if cfg.json {
 		if err := progress.Clear(); err != nil {
-			return 1
+			code = 1
 		}
 		if err := writeJSONResults(deps.stdout, results); err != nil {
 			fmt.Fprintln(deps.stderr, "gosmb: could not write output")

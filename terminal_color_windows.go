@@ -2,8 +2,9 @@ package main
 
 import "golang.org/x/sys/windows"
 
-// Windows consoles need virtual terminal processing before ANSI colors can be
-// emitted. Leave unsupported consoles unchanged and let the caller use plain text.
+// Windows consoles need virtual terminal processing for colors and cursor
+// controls. Call separately for stdout and stderr, restoring in reverse order
+// when the handles refer to the same console buffer.
 func enableTerminalColor(fd uintptr) (restore func(), enabled bool) {
 	restore = func() {}
 	handle := windows.Handle(fd)

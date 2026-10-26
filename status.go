@@ -42,40 +42,9 @@ const (
 	statusNoShares
 	statusAuthUnverified
 	statusGuestMismatch
+	statusScanTimeout
 	statusCount
 )
-
-var statusLabels = [...]string{
-	statusOK:                "OK",
-	statusAuthFailed:        "AUTH_FAILED",
-	statusAccountLocked:     "ACCOUNT_LOCKED",
-	statusAccountDisabled:   "ACCOUNT_DISABLED",
-	statusPasswordExpired:   "PASSWORD_EXPIRED",
-	statusPasswordChange:    "PASSWORD_CHANGE",
-	statusAccountExpired:    "ACCOUNT_EXPIRED",
-	statusAccountRestricted: "ACCOUNT_RESTRICTED",
-	statusLogonHours:        "LOGON_HOURS",
-	statusWorkstationDenied: "WORKSTATION_DENIED",
-	statusConnectFailed:     "CONNECT_FAILED",
-	statusConnectRefused:    "CONNECT_REFUSED",
-	statusConnectTimeout:    "CONNECT_TIMEOUT",
-	statusDNSFailed:         "DNS_FAILED",
-	statusSMBFailed:         "SMB_FAILED",
-	statusSMBTimeout:        "SMB_TIMEOUT",
-	statusNegotiateFailed:   "NEGOTIATE_FAILED",
-	statusEnumDenied:        "ENUM_DENIED",
-	statusEnumFailed:        "ENUM_FAILED",
-	statusEnumPartial:       "ENUM_PARTIAL",
-	statusEnumTimeout:       "ENUM_TIMEOUT",
-	statusCheckFailed:       "CHECK_FAILED",
-	statusCheckTimeout:      "CHECK_TIMEOUT",
-	statusCleanupFailed:     "CLEANUP_FAILED",
-	statusCleanupTimeout:    "CLEANUP_TIMEOUT",
-	statusCanceled:          "CANCELED",
-	statusNoShares:          "NO_SHARES",
-	statusAuthUnverified:    "AUTH_UNVERIFIED",
-	statusGuestMismatch:     "GUEST_MISMATCH",
-}
 
 // tableStatus never interprets free-form Error text. Recorded host failures
 // affect every row; a failed share check affects only that share. In particular,
@@ -97,8 +66,8 @@ func tableStatus(result Result, share *ShareResult) string {
 			return statusLabels[status]
 		}
 	}
-	if result.cleanupStatus != statusUnset {
-		return statusLabels[result.cleanupStatus]
+	if result.completionStatus != statusUnset {
+		return statusLabels[result.completionStatus]
 	}
 	if share == nil && result.Enumeration == "ok" && len(result.Shares) == 0 {
 		return statusLabels[statusNoShares]
@@ -174,11 +143,6 @@ func inferredShareStatus(share ShareResult) scanStatus {
 	return statusOK
 }
 
-func typedTimeout(err error) bool {
-	var networkError net.Error
-	return errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) && networkError.Timeout()
-}
-
 // Socket closure is how a context interruption reaches an in-flight exchange.
 // The retained transport cause distinguishes it from an ordinary protocol error.
 func operationStatus(err, transportErr error, failed, timeout scanStatus) scanStatus {
@@ -187,6 +151,12 @@ func operationStatus(err, transportErr error, failed, timeout scanStatus) scanSt
 	}
 	if typedTimeout(err) {
 		return timeout
+	}
+	// A server already answered this operation. Preserve that rejection when
+	// cleanup or later bookkeeping observes a transport interruption. A joined
+	// error containing its own timeout/cancellation still takes precedence above.
+	if isSMBStatusError(err) {
+		return failed
 	}
 	if errors.Is(transportErr, context.Canceled) {
 		return statusCanceled
@@ -197,34 +167,47 @@ func operationStatus(err, transportErr error, failed, timeout scanStatus) scanSt
 	return failed
 }
 
+// Authentication classification and its diagnostic text share one mapping so
+// JSON, TSV diagnostics, and the interactive table cannot disagree. Only a
+// session-setup rejection describes an authentication failure.
+func authenticationFailure(err error) (scanStatus, string) {
+	status, ok := errors.AsType[*smb.NTStatusError](err)
+	if !ok || status.Command != smb.SessionSetupCommand {
+		return statusUnset, ""
+	}
+	switch status.Status {
+	case smb.StatusLogonFailure:
+		return statusAuthFailed, "username or password was rejected"
+	case smb.StatusAccessDenied:
+		return statusAuthFailed, "server denied logon"
+	case smb.StatusAccountRestriction:
+		return statusAccountRestricted, "account restrictions prevent logon"
+	case smb.StatusInvalidLogonHours:
+		return statusLogonHours, "logon is not allowed at this time"
+	case smb.StatusInvalidWorkstation:
+		return statusWorkstationDenied, "logon is not allowed from this workstation"
+	case smb.StatusPasswordExpired:
+		return statusPasswordExpired, "password has expired"
+	case smb.StatusAccountDisabled:
+		return statusAccountDisabled, "account is disabled"
+	case smb.StatusAccountExpired:
+		return statusAccountExpired, "account has expired"
+	case smb.StatusPasswordMustChange:
+		return statusPasswordChange, "password must be changed"
+	case smb.StatusAccountLockedOut:
+		return statusAccountLocked, "account is locked out"
+	}
+	return statusUnset, ""
+}
+
 func connectionStatus(err, transportErr error, reachable bool) scanStatus {
 	if reachable {
-		var status *smb.NTStatusError
-		if errors.As(err, &status) {
+		if status, ok := errors.AsType[*smb.NTStatusError](err); ok {
 			if status.Command == 0 {
 				return statusNegotiateFailed
 			}
-			if status.Command == smb.SessionSetupCommand {
-				switch status.Status {
-				case smb.StatusLogonFailure, smb.StatusAccessDenied:
-					return statusAuthFailed
-				case smb.StatusAccountLockedOut:
-					return statusAccountLocked
-				case smb.StatusAccountDisabled:
-					return statusAccountDisabled
-				case smb.StatusPasswordExpired:
-					return statusPasswordExpired
-				case smb.StatusPasswordMustChange:
-					return statusPasswordChange
-				case smb.StatusAccountExpired:
-					return statusAccountExpired
-				case smb.StatusAccountRestriction:
-					return statusAccountRestricted
-				case smb.StatusInvalidLogonHours:
-					return statusLogonHours
-				case smb.StatusInvalidWorkstation:
-					return statusWorkstationDenied
-				}
+			if failure, _ := authenticationFailure(err); failure != statusUnset {
+				return failure
 			}
 			return statusSMBFailed
 		}
@@ -233,8 +216,7 @@ func connectionStatus(err, transportErr error, reachable bool) scanStatus {
 	if errors.Is(err, context.Canceled) || errors.Is(transportErr, context.Canceled) {
 		return statusCanceled
 	}
-	var dnsError *net.DNSError
-	if errors.As(err, &dnsError) {
+	if _, ok := errors.AsType[*net.DNSError](err); ok {
 		return statusDNSFailed
 	}
 	// Windows sockets use WSAECONNREFUSED (10061), distinct from Go's

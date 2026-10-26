@@ -98,9 +98,7 @@ func ntlmAuthenticate(negotiate, challenge []byte, user, password, domain, host 
 		return nil, nil, err
 	}
 	var nonce [8]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return nil, nil, err
-	}
+	rand.Read(nonce[:])
 	responseKey := ntlmV2Key(user, password, domain)
 	lm, nt, baseKey := ntlmV2Responses(responseKey, challenge[24:32], nonce[:], timestamp[:], info)
 	if serverTimestamp {
@@ -112,9 +110,7 @@ func ntlmAuthenticate(negotiate, challenge []byte, user, password, domain, host 
 	var encryptedKey []byte
 	sessionKey = append([]byte(nil), baseKey...)
 	if flags&ntlmKeyExch != 0 && flags&(ntlmSign|ntlmSeal) != 0 {
-		if _, err := rand.Read(sessionKey); err != nil {
-			return nil, nil, err
-		}
+		rand.Read(sessionKey)
 		stream, err := rc4.NewCipher(baseKey)
 		if err != nil {
 			return nil, nil, err

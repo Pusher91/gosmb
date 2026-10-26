@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func BenchmarkTextOutput(b *testing.B) {
@@ -95,21 +96,29 @@ func TestDisplayTextEscapingAndTruncation(t *testing.T) {
 		want  string
 	}{
 		{"\n\r\t\x00\x1b\x7f\u0080\u00ad\u200b\u202e\u2028\u2029\ufeff\U000e0001", -1, `\n\r\t\x00\x1b\x7f\x80\xad\u200b\u202e\u2028\u2029\ufeff\U000e0001`},
-		{"a\nb", 3, "a\\n…"},
+		{"a\nb", 3, "a…"},
 		{"a\nb", 2, "a…"},
-		{"αβγ", 2, "αβ…"},
+		{"a\n", 3, `a\n`},
+		{"αβγ", 2, "α…"},
 		{"a\x00", 4, "a…"},
 		{"a\x00", 5, `a\x00`},
 		{"\u202e", 6, `\u202e`},
 		{"\U000e0001", 9, "…"},
 		{"\U000e0001", 10, `\U000e0001`},
 		{"", 0, ""},
-		{"x", 0, "…"},
+		{"x", 0, ""},
+		{"\x00", 0, ""},
+		{"x", 1, "x"},
+		{"xy", 1, "…"},
 		{"\xffx", -1, "�x"},
-		{"\xffx", 1, "�…"},
+		{"\xffx", 1, "…"},
 	} {
-		if got := displayText(tc.input, tc.limit); got != tc.want {
+		got := displayText(tc.input, tc.limit)
+		if got != tc.want {
 			t.Errorf("displayText(%q, %d) = %q; want %q", tc.input, tc.limit, got, tc.want)
+		}
+		if tc.limit >= 0 && utf8.RuneCountInString(got) > tc.limit {
+			t.Errorf("displayText(%q, %d) exceeded its limit: %q", tc.input, tc.limit, got)
 		}
 	}
 }
@@ -175,7 +184,7 @@ func TestTSVPreservesFullEscapedCells(t *testing.T) {
 }
 
 func TestOutputEscapesControlsInCellsAndDiagnostics(t *testing.T) {
-	bad := "value\x1b[2J\t\n\u202e"
+	bad := "value\x1b[2J\t\n\u202e" + `\n`
 	result := Result{Target: bad, ServerIP: bad, Reachable: true, Authentication: bad, Enumeration: bad, Error: bad, Shares: []ShareResult{{Name: bad, Accessible: bad, Read: bad, Write: bad, Error: bad}}}
 	var out, diagnostics bytes.Buffer
 	if err := writeTextResult(&out, result); err != nil {
@@ -185,8 +194,13 @@ func TestOutputEscapesControlsInCellsAndDiagnostics(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := parseTestTSV(t, out.String())
-	if len(rows) != 1 || rows[0][0] != `value\x1b[2J\t\n\u202e` || rows[0][1] != `value\x1b[2J\t\n\u202e` || rows[0][5] != `value\x1b[2J\t\n\u202e` {
-		t.Fatalf("untrusted cells were not escaped: %#v", rows)
+	if len(rows) != 1 {
+		t.Fatalf("untrusted cells changed row boundaries: %#v", rows)
+	}
+	for _, column := range []int{0, 1, 2, 3, 5} {
+		if rows[0][column] != `value\x1b[2J\t\n\u202e\\n` {
+			t.Errorf("column %d controls and literal backslashes were not escaped exactly once: %q", column, rows[0][column])
+		}
 	}
 	if strings.ContainsAny(out.String()+diagnostics.String(), "\x1b\r\u202e") || strings.ContainsRune(diagnostics.String(), '\t') {
 		t.Fatalf("terminal controls escaped into output: %q %q", out.String(), diagnostics.String())
@@ -481,7 +495,12 @@ func TestTextOutputStopsAfterFailedBatch(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		write func(io.Writer, Result) error
-	}{{"TSV", writeTextResult}, {"diagnostics", writeTextDiagnostics}} {
+	}{
+		{"TSV", writeTextResult},
+		{"diagnostics", writeTextDiagnostics},
+		{"aligned", func(out io.Writer, result Result) error { return writeAlignedResult(out, result, false) }},
+		{"colored", func(out io.Writer, result Result) error { return writeAlignedResult(out, result, true) }},
+	} {
 		for _, short := range []bool{false, true} {
 			name := "write_error"
 			if short {

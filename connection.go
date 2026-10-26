@@ -47,9 +47,20 @@ func (c *trackedConn) Write(p []byte) (int, error) {
 // sync so the scanner stops issuing operations on the poisoned transport.
 func (c *trackedConn) Close() error { return c.owner.closeSocket() }
 
+// Use one timeout definition for transport shutdown and result classification.
+func typedTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	networkError, ok := errors.AsType[net.Error](err)
+	return ok && networkError.Timeout()
+}
+
 func (d *boundedDialer) recordTimeout(err error) {
-	var networkError net.Error
-	if !errors.Is(err, context.DeadlineExceeded) && !(errors.As(err, &networkError) && networkError.Timeout()) {
+	if !typedTimeout(err) {
 		return
 	}
 	d.mu.Lock()

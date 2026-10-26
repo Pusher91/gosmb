@@ -84,8 +84,10 @@ func TestParseTarget(t *testing.T) {
 		{"192.0.2.10", Target{"192.0.2.10", 445}},
 		{"192.0.2.10:1445", Target{"192.0.2.10", 1445}},
 		{"2001:db8::1", Target{"2001:db8::1", 445}},
+		{"2001:0DB8::1:1445", Target{"2001:db8::1:1445", 445}},
 		{"[2001:db8::1]:1445", Target{"2001:db8::1", 1445}},
 		{"[::1]", Target{"::1", 445}},
+		{"[FE80:0:0:0:0:0:0:1%Eth0]", Target{"fe80::1%Eth0", 445}},
 		{"[fe80::1%eth0]:445", Target{"fe80::1%eth0", 445}},
 	} {
 		got, err := parseTarget(tt.input)
@@ -97,7 +99,7 @@ func TestParseTarget(t *testing.T) {
 			t.Errorf("CLI target %q = %#v, %v; want %#v", tt.input, cfg.targets, err, tt.want)
 		}
 	}
-	for _, input := range []string{"", "https://server", "smb://server/share", `\\server\share`, "../hosts.txt", "server:0", "server:65536", "server:-1", "server:abc", "server:", ":445", "[server]:445", "[::1]:", "[::1]:-1", "server\t", "server\x1b[31m", "bad host", "-host", "host-", "host..name", "999.2.3.4", "192.168.001.1", "host/path", "user@host", "host#comment", "[fe80::1%bad!]:445"} {
+	for _, input := range []string{"", "https://server", "smb://server/share", `\\server\share`, "../hosts.txt", "server:0", "server:65536", "server:-1", "server:abc", "server:", ":445", "[server]:445", "[192.0.2.10]", "[192.0.2.10]:445", "server:part:445", "[::1]:", "[::1]:-1", "[::1]:445:1445", "server\t", "server\x1b[31m", "bad host", "-host", "host-", "host..name", "999.2.3.4", "192.168.001.1", "host/path", "user@host", "host#comment", "[fe80::1%bad!]:445", "fe80::1%eth0:445"} {
 		if _, err := parseTarget(input); err == nil {
 			t.Errorf("accepted malformed target %q", input)
 		}

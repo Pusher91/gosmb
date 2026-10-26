@@ -69,9 +69,9 @@ type Options struct {
 }
 
 type tree struct {
-	id, flags, access uint32
-	kind              byte
-	closed            bool
+	id, access uint32
+	kind       byte
+	closed     bool
 }
 type Connection struct {
 	maxRead, maxWrite                             uint32
@@ -112,6 +112,11 @@ func NewConnection(opts Options) (*Connection, error) {
 	}
 	return c, nil
 }
+
+// IsClosed reports whether Close or a terminal client operation marked the
+// connection closed. Caller cancellation can close the underlying transport
+// before a client operation observes it; this does not probe transport liveness.
+func (c *Connection) IsClosed() bool { return c.closed.Load() }
 
 func (c *Connection) Close() {
 	// Closing the transport invalidates every tree/handle without mutating
@@ -164,7 +169,7 @@ func (c *Connection) hashPacket(packet []byte) {
 	h := sha512.New()
 	h.Write(c.preauth[:])
 	h.Write(packet)
-	copy(c.preauth[:], h.Sum(nil))
+	copy(c.preauth[:], h.Sum(c.preauth[:0]))
 }
 
 func (c *Connection) exchange(command uint16, treeID uint32, body []byte) (result []byte, err error) {
@@ -172,10 +177,12 @@ func (c *Connection) exchange(command uint16, treeID uint32, body []byte) (resul
 		return nil, net.ErrClosed
 	}
 	defer func() {
+		if err == nil {
+			return
+		}
 		// A protocol, integrity, or transport error poisons the stream. Normal
 		// authenticated NT status errors permit the documented read-only fallbacks.
-		var status *NTStatusError
-		if err != nil && !errors.As(err, &status) {
+		if _, ok := errors.AsType[*NTStatusError](err); !ok {
 			c.Close()
 		}
 	}()
@@ -395,9 +402,7 @@ func (c *Connection) negotiate() error {
 	// session is a separately reported, deliberately unsigned identity.
 	binary.LittleEndian.PutUint16(body[4:], 3)
 	binary.LittleEndian.PutUint32(body[8:], 0x40)
-	if _, err := rand.Read(body[12:28]); err != nil {
-		return err
-	}
+	rand.Read(body[12:28])
 	binary.LittleEndian.PutUint32(body[28:], uint32(64+len(body)))
 	binary.LittleEndian.PutUint16(body[32:], 3)
 	for i, d := range dialects {
@@ -414,9 +419,7 @@ func (c *Connection) negotiate() error {
 	binary.LittleEndian.PutUint16(preauth, 1)
 	binary.LittleEndian.PutUint16(preauth[2:], 32)
 	binary.LittleEndian.PutUint16(preauth[4:], 1)
-	if _, err := rand.Read(preauth[6:]); err != nil {
-		return err
-	}
+	rand.Read(preauth[6:])
 	for _, ctx := range []struct {
 		kind uint16
 		data []byte
@@ -683,11 +686,11 @@ func (c *Connection) TreeConnect(name string) error {
 	if binary.LittleEndian.Uint32(r[16:])&2 != 0 {
 		return c.protocolError("tree connect response has no tree identifier")
 	}
-	t := &tree{id: binary.LittleEndian.Uint32(r[36:]), kind: r[66], flags: binary.LittleEndian.Uint32(r[68:]), access: binary.LittleEndian.Uint32(r[76:])}
+	t := &tree{id: binary.LittleEndian.Uint32(r[36:]), kind: r[66], access: binary.LittleEndian.Uint32(r[76:])}
 	if t.id == 0xffffffff || t.kind < 1 || t.kind > 3 {
 		return c.protocolError("invalid SMB tree identifier or share type")
 	}
-	if t.flags&0x8000 != 0 && (!c.encryptionAvailable || c.sessionFlags&3 != 0) {
+	if binary.LittleEndian.Uint32(r[68:])&0x8000 != 0 && (!c.encryptionAvailable || c.sessionFlags&3 != 0) {
 		return errors.New("share requires unavailable encryption")
 	}
 	if err := c.validateNegotiateInfo(t.id); err != nil {
@@ -735,7 +738,11 @@ func rootRequest(desired uint32, maximal bool) ([]byte, error) {
 	if desired != FileListDirectory && desired != FileReadAttributes {
 		return nil, errors.New("refusing non-read-only root access")
 	}
-	b := make([]byte, 64)
+	size := 64
+	if maximal {
+		size += 24
+	}
+	b := make([]byte, size)
 	binary.LittleEndian.PutUint16(b, 57)
 	binary.LittleEndian.PutUint32(b[4:], 2)
 	binary.LittleEndian.PutUint32(b[24:], desired)
@@ -746,11 +753,10 @@ func rootRequest(desired uint32, maximal bool) ([]byte, error) {
 	if maximal {
 		binary.LittleEndian.PutUint32(b[48:], 128)
 		binary.LittleEndian.PutUint32(b[52:], 24)
-		ctx := make([]byte, 24)
+		ctx := b[64:]
 		binary.LittleEndian.PutUint16(ctx[4:], 16)
 		binary.LittleEndian.PutUint16(ctx[6:], 4)
 		copy(ctx[16:], "MxAc")
-		b = append(b, ctx...)
 	}
 	return b, nil
 }
@@ -788,8 +794,7 @@ func (c *Connection) create(t *tree, body []byte, pipe bool) (*File, error) {
 		return nil, err
 	}
 	if len(r) < 152 {
-		c.Close()
-		return nil, errors.New("truncated open response")
+		return nil, c.protocolError("truncated open response")
 	}
 	f := &File{c: c, tree: t, pipe: pipe}
 	copy(f.id[:], r[128:144])

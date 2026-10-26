@@ -458,11 +458,14 @@ func (f *enumerationFixture) assertUnchanged(t *testing.T, wantOpens int) {
 type guardedEnumerationVFS struct {
 	mu                                                               sync.Mutex
 	denyList                                                         bool
+	denyAttributes                                                   bool
 	negotiationStatus                                                uint32
 	authenticationStatus                                             uint32
 	enumerationStatus                                                uint32
 	malformedEnumeration                                             bool
 	rejectFirstOpen                                                  uint32
+	ipcConnectStatus                                                 uint32
+	diskConnectStatus                                                uint32
 	deniedIPCCleanup                                                 uint16
 	deniedDiskCleanup                                                uint16
 	opens, successful, closed, connections, authAttempts, guestOpens int
@@ -602,6 +605,12 @@ func (s *fixtureSMBServer) serve() {
 			return
 		}
 		s.fixture.guard.mu.Lock()
+		if tree == 1 && command == 3 && s.fixture.guard.ipcConnectStatus != 0 {
+			status = s.fixture.guard.ipcConnectStatus
+		}
+		if tree == 2 && command == 3 && s.fixture.guard.diskConnectStatus != 0 {
+			status = s.fixture.guard.diskConnectStatus
+		}
 		if (tree == 1 && command == s.fixture.guard.deniedIPCCleanup) ||
 			(tree == 2 && command == s.fixture.guard.deniedDiskCleanup) {
 			status = 0xc0000022
@@ -1096,6 +1105,9 @@ func (s *fixtureSMBServer) create(p []byte, tree uint32) ([]byte, uint32, uint32
 			return nil, guard.rejectFirstOpen, tree, nil
 		}
 		if guard.denyList && desired == 1 {
+			return nil, 0xc0000022, tree, nil
+		}
+		if guard.denyAttributes && desired == 0x80 {
 			return nil, 0xc0000022, tree, nil
 		}
 		handle, err := os.Open(s.fixture.root)

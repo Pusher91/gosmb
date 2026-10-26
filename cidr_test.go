@@ -19,6 +19,15 @@ func BenchmarkParseTargetList(b *testing.B) {
 		hosts.WriteString(strconv.Itoa(i))
 		hosts.WriteString(".example:1445\n")
 	}
+	var paddedHosts strings.Builder
+	padding := strings.Repeat(" ", 60000)
+	for i := range 64 {
+		paddedHosts.WriteString("server-")
+		paddedHosts.WriteString(strconv.Itoa(i))
+		paddedHosts.WriteString(".example:1445")
+		paddedHosts.WriteString(padding)
+		paddedHosts.WriteByte('\n')
+	}
 	for _, tc := range []struct {
 		name, input string
 		count       int
@@ -27,6 +36,7 @@ func BenchmarkParseTargetList(b *testing.B) {
 		{"IPv6", "2001:db8::/116\n", 4096},
 		{"MappedOverlap", "10.0.0.0/20\n::ffff:10.0.0.0/116\n10.0.1.0/24\n", 4096},
 		{"Hostnames", hosts.String(), 1000},
+		{"PaddedHostnames", paddedHosts.String(), 64},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ReportAllocs()
@@ -149,8 +159,14 @@ func TestTargetListDeduplicatesMappedIPv4WithoutChangingFirstSpelling(t *testing
 		{"overlapping ranges and ports", "::ffff:192.0.2.0/127\n192.0.2.0/31\n192.0.2.1:1445\n[::ffff:192.0.2.1]:1445\n", []Target{
 			{"::ffff:192.0.2.0", 445}, {"::ffff:192.0.2.1", 445}, {"192.0.2.1", 1445},
 		}},
-		{"scoped spellings stay distinct", "192.0.2.1\n::ffff:192.0.2.1%eth0\n::ffff:192.0.2.1%Eth0\n", []Target{
-			{"192.0.2.1", 445}, {"::ffff:192.0.2.1%eth0", 445}, {"::ffff:192.0.2.1%Eth0", 445},
+		{"mapped zones do not select an interface", "192.0.2.1\n::ffff:192.0.2.1%eth0\n::ffff:192.0.2.1%Eth0\n", []Target{
+			{"192.0.2.1", 445},
+		}},
+		{"mapped zone spelling retained first", "::ffff:192.0.2.1%NONEXISTENT\n192.0.2.1\n::ffff:192.0.2.1\n::ffff:192.0.2.1%eth0\n", []Target{
+			{"::ffff:192.0.2.1%NONEXISTENT", 445},
+		}},
+		{"mapped zones preserve separate ports", "[::ffff:192.0.2.1%eth0]:1445\n192.0.2.1\n[::ffff:192.0.2.1%Eth0]:1445\n", []Target{
+			{"::ffff:192.0.2.1%eth0", 1445}, {"192.0.2.1", 445},
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -160,7 +176,7 @@ func TestTargetListDeduplicatesMappedIPv4WithoutChangingFirstSpelling(t *testing
 			}
 		})
 	}
-	got, err := parseTargetList(context.Background(), strings.NewReader("10.0.0.0/16\n::ffff:10.0.0.0/112\n"))
+	got, err := parseTargetList(context.Background(), strings.NewReader("10.0.0.0/16\n::ffff:10.0.0.0/112\n::ffff:10.0.0.1%eth0\n"))
 	if err != nil || len(got) != maxTargets {
 		t.Fatalf("mapped duplicates consumed unique endpoint capacity: count=%d error=%v", len(got), err)
 	}
@@ -168,7 +184,7 @@ func TestTargetListDeduplicatesMappedIPv4WithoutChangingFirstSpelling(t *testing
 
 func TestCLIMappedIPv4AliasesStartOnlyOneScan(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hosts.txt")
-	if err := os.WriteFile(path, []byte("[::ffff:192.0.2.1]:1445\n192.0.2.1:1445\n"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("[::ffff:192.0.2.1%Eth0]:1445\n192.0.2.1:1445\n[::ffff:192.0.2.1]:1445\n[::ffff:192.0.2.1%eth0]:1445\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	var out, diagnostics bytes.Buffer
@@ -176,7 +192,7 @@ func TestCLIMappedIPv4AliasesStartOnlyOneScan(t *testing.T) {
 	calls := 0
 	deps.scan = func(_ context.Context, target Target, _ Options) Result {
 		calls++
-		if target != (Target{"::ffff:192.0.2.1", 1445}) {
+		if target != (Target{"::ffff:192.0.2.1%Eth0", 1445}) {
 			t.Errorf("scan lost the first target spelling: %+v", target)
 		}
 		return Result{Target: target.String(), ServerIP: target.Host, Authentication: "guest", Enumeration: "ok"}
@@ -185,7 +201,7 @@ func TestCLIMappedIPv4AliasesStartOnlyOneScan(t *testing.T) {
 	if code != 0 || calls != 1 {
 		t.Fatalf("equivalent literal endpoints were scanned more than once: exit=%d scans=%d", code, calls)
 	}
-	if rows := parseTestTSV(t, out.String()); len(rows) != 1 || rows[0][0] != "[::ffff:192.0.2.1]:1445" {
+	if rows := parseTestTSV(t, out.String()); len(rows) != 1 || rows[0][0] != "[::ffff:192.0.2.1%Eth0]:1445" {
 		t.Fatalf("output lost the first supplied literal endpoint: %q", out.String())
 	}
 }

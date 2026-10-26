@@ -100,7 +100,7 @@ func aesCMAC(key, message []byte) ([]byte, error) {
 		state[i] ^= last[i]
 	}
 	block.Encrypt(state[:], state[:])
-	return append([]byte(nil), state[:]...), nil
+	return state[:], nil
 }
 
 func cmacDouble(x [16]byte) (out [16]byte) {
@@ -128,9 +128,7 @@ func encryptSMB(dialect uint16, key []byte, sessionID uint64, message []byte) ([
 	// seal directly into the output buffer. The tag moves into the header.
 	header := make([]byte, 52, 52+len(message)+16)
 	copy(header, "\xfdSMB")
-	if _, err := rand.Read(header[20 : 20+nonceLen]); err != nil {
-		return nil, err
-	}
+	rand.Read(header[20 : 20+nonceLen])
 	binary.LittleEndian.PutUint32(header[36:40], uint32(len(message)))
 	binary.LittleEndian.PutUint16(header[42:44], 1)
 	binary.LittleEndian.PutUint64(header[44:52], sessionID)

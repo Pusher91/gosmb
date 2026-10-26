@@ -338,7 +338,8 @@ func encodeShareRequest(host string, resume uint32) ([]byte, error) {
 		return nil, errors.New("invalid RPC server name")
 	}
 	serverName := utf16Bytes(`\\` + strings.TrimPrefix(host, `\\`) + "\x00")
-	var b []byte
+	// Reserve the 16-byte string header, aligned name, and 32-byte arguments.
+	b := make([]byte, 0, 16+((len(serverName)+3)&^3)+32)
 	put := func(value uint32) { b = binary.LittleEndian.AppendUint32(b, value) }
 	put(0x20000) // Unique server-name pointer, followed by its string referent.
 	put(uint32(len(serverName) / 2))

@@ -11,11 +11,8 @@ import (
 )
 
 func scanTarget(ctx context.Context, target Target, opts Options) (result Result) {
-	if opts.HostTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, opts.HostTimeout)
-		defer cancel()
-	}
+	ctx, cancel := withHostTimeout(ctx, opts.HostTimeout)
+	defer cancel()
 	result = Result{Target: target.String(), Authentication: "not_attempted", Enumeration: "not_attempted", Shares: []ShareResult{}, explicitGuest: opts.Guest, status: statusOK}
 	// A literal target IP is known before dialing, even if the scan fails or
 	// is canceled. Keep it as the result's identity throughout the scan.
@@ -30,7 +27,7 @@ func scanTarget(ctx context.Context, target Target, opts Options) (result Result
 		}
 		return
 	}
-	wire := &boundedDialer{ctx: ctx, target: target.String(), timeout: opts.Timeout}
+	wire := &boundedDialer{ctx: ctx, target: result.Target, timeout: opts.Timeout}
 	stop := context.AfterFunc(ctx, wire.close)
 	var conn *smb.Connection
 	defer func() {
@@ -43,16 +40,16 @@ func scanTarget(ctx context.Context, target Target, opts Options) (result Result
 			}
 		}
 		if conn != nil {
-			// The native exchange arms deadlines and refuses a closed transport.
-			// A transport already lost during a share check is not an additional
-			// host-wide cleanup failure on every successfully checked share.
-			reportCleanup := wire.err() == nil
+			// A failed operation may already have closed the client. Otherwise,
+			// interruption before logoff is a new cleanup failure, even when a
+			// completed check lacked metadata or received a server rejection.
+			reportCleanup := !conn.IsClosed()
 			if err := conn.Logoff(); err != nil {
 				if result.Error == "" {
 					result.Error = fmt.Sprintf("SMB logoff: %v", err)
 				}
-				if reportCleanup && result.cleanupStatus == statusUnset {
-					result.cleanupStatus = operationStatus(err, wire.err(), statusCleanupFailed, statusCleanupTimeout)
+				if reportCleanup && result.completionStatus == statusUnset {
+					result.completionStatus = operationStatus(err, wire.err(), statusCleanupFailed, statusCleanupTimeout)
 				}
 			}
 		}
@@ -78,12 +75,14 @@ func scanTarget(ctx context.Context, target Target, opts Options) (result Result
 		result.status = connectionStatus(err, wire.err(), result.Reachable)
 		if result.Reachable {
 			result.Authentication = "error"
-			if authenticationFailureReason(err) != "" {
+			if failure, _ := authenticationFailure(err); failure != statusUnset {
 				result.Authentication = "failed"
 			}
 		}
 		result.Error = connectionFailureMessage(err, result.Reachable)
-		result.authenticationComplete = !wire.timedOut() || result.Authentication == "failed"
+		// A received rejection completes this stage even when a later context
+		// check observes a deadline, including unrecognized SMB status codes.
+		result.authenticationComplete = isSMBStatusError(err) || !wire.timedOut()
 		return
 	}
 	result.authenticationComplete = true
@@ -113,7 +112,9 @@ func scanTarget(ctx context.Context, target Target, opts Options) (result Result
 	enumerated, err := conn.EnumerateShares()
 	shares := discoveredShares(enumerated.Shares)
 	result.Enumeration = "ok"
-	result.enumerationComplete = enumerated.Complete || enumerated.Failure != nil || !wire.timedOut()
+	// IPC$ TreeConnect can receive a server rejection before the enumeration
+	// cleanup bookkeeping records ShareEnumeration.Failure.
+	result.enumerationComplete = enumerated.Complete || enumerated.Failure != nil || isSMBStatusError(err) || !wire.timedOut()
 	if err != nil {
 		// Cleanup can fail after every page has arrived. Keep enumeration and
 		// its share list complete while reporting the cleanup as a host error.
@@ -124,7 +125,7 @@ func scanTarget(ctx context.Context, target Target, opts Options) (result Result
 				result.Enumeration = "denied"
 			}
 		} else {
-			result.cleanupStatus = operationStatus(err, wire.err(), statusCleanupFailed, statusCleanupTimeout)
+			result.completionStatus = operationStatus(err, wire.err(), statusCleanupFailed, statusCleanupTimeout)
 		}
 		result.Error = fmt.Sprintf("share enumeration: %v", err)
 	}
@@ -173,6 +174,12 @@ func markHostTimeout(result *Result) {
 	}
 	if result.Error == "" {
 		result.Error = "scan timed out"
+		// The whole-host budget can expire after the final server response.
+		// Keep completed checks intact while recording this otherwise missing
+		// outcome below primary failures and already recorded cleanup errors.
+		if result.completionStatus == statusUnset {
+			result.completionStatus = statusScanTimeout
+		}
 	}
 }
 
@@ -199,9 +206,8 @@ func connectionFailureMessage(err error, reachable bool) string {
 	if !reachable {
 		return fmt.Sprintf("connection failed: %v", err)
 	}
-	var status *smb.NTStatusError
-	if errors.As(err, &status) {
-		if reason := authenticationFailureReason(err); reason != "" {
+	if status, ok := errors.AsType[*smb.NTStatusError](err); ok {
+		if _, reason := authenticationFailure(err); reason != "" {
 			return fmt.Sprintf("authentication failed: %s (SMB status 0x%08x)", reason, status.Status)
 		}
 		switch status.Command {
@@ -214,41 +220,9 @@ func connectionFailureMessage(err error, reachable bool) string {
 	return fmt.Sprintf("SMB connection: %v", err)
 }
 
-// Only a recognized session-setup rejection describes an authentication
-// failure. The same status during negotiation must not blame the credentials.
-func authenticationFailureReason(err error) string {
-	var status *smb.NTStatusError
-	if !errors.As(err, &status) || status.Command != smb.SessionSetupCommand {
-		return ""
-	}
-	switch status.Status {
-	case smb.StatusLogonFailure:
-		return "username or password was rejected"
-	case smb.StatusAccessDenied:
-		return "server denied logon"
-	case smb.StatusAccountRestriction:
-		return "account restrictions prevent logon"
-	case smb.StatusInvalidLogonHours:
-		return "logon is not allowed at this time"
-	case smb.StatusInvalidWorkstation:
-		return "logon is not allowed from this workstation"
-	case smb.StatusPasswordExpired:
-		return "password has expired"
-	case smb.StatusAccountDisabled:
-		return "account is disabled"
-	case smb.StatusAccountExpired:
-		return "account has expired"
-	case smb.StatusPasswordMustChange:
-		return "password must be changed"
-	case smb.StatusAccountLockedOut:
-		return "account is locked out"
-	}
-	return ""
-}
-
 func hasSMBStatus(err error, codes ...uint32) bool {
-	var status *smb.NTStatusError
-	if !errors.As(err, &status) {
+	status, ok := errors.AsType[*smb.NTStatusError](err)
+	if !ok {
 		return false
 	}
 	for _, code := range codes {
@@ -257,6 +231,11 @@ func hasSMBStatus(err error, codes ...uint32) bool {
 		}
 	}
 	return false
+}
+
+func isSMBStatusError(err error) bool {
+	_, ok := errors.AsType[*smb.NTStatusError](err)
+	return ok
 }
 
 func accessDenied(err error) bool {
@@ -296,7 +275,7 @@ func inspectShare(conn *smb.Connection, wire *boundedDialer, share discoveredSha
 	}
 	if err := conn.TreeConnect(share.Name); err != nil {
 		result.Error = fmt.Sprintf("connect share: %v", err)
-		result.probeComplete = !wire.timedOut()
+		result.probeComplete = isSMBStatusError(err) || !wire.timedOut()
 		if accessDenied(err) {
 			result.Accessible, result.Read, result.Write = Denied, Denied, Denied
 			result.WriteBasis = "share_connection_denied"
@@ -345,10 +324,14 @@ func inspectShare(conn *smb.Connection, wire *boundedDialer, share discoveredSha
 	// A successful root-open response answered both requested questions even
 	// if it omitted MxAc or its later CLOSE timed out. Missing metadata remains
 	// UNKNOWN; a timeout waiting for the root-open response is unanswered.
-	result.probeComplete = err == nil || !wire.timedOut()
+	// A final server rejection also completed the probe. A deadline observed
+	// afterward belongs to cleanup, not to this already received response.
+	result.probeComplete = err == nil || isSMBStatusError(err) || !wire.timedOut()
 	if err != nil {
 		result.Error = fmt.Sprintf("root access query: %v", err)
-		if !accessDenied(err) {
+		// A denied metadata fallback does not answer WRITE unless the share
+		// mask already denies it. Keep that missing permission check visible.
+		if !accessDenied(err) || result.Write == Unknown {
 			result.status = operationStatus(err, wire.err(), statusCheckFailed, statusCheckTimeout)
 		}
 	} else if root.metadataErr != nil {

@@ -53,8 +53,9 @@ type Result struct {
 
 	// Interactive-table outcomes are recorded at the failing operation. They
 	// deliberately stay separate from public diagnostics and serialized data.
-	status        scanStatus
-	cleanupStatus scanStatus
+	status scanStatus
+	// Cleanup or a final time-budget outcome, below primary host/share failures.
+	completionStatus scanStatus
 }
 
 type ShareResult struct {
