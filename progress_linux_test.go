@@ -164,6 +164,9 @@ func TestPipedProgressWithRealTeePreservesRows(t *testing.T) {
 			} else if strings.Count(terminal, "Progress: 100% (8/8 hosts completed)") != 1 {
 				t.Errorf("completed scan lost final progress: %q", terminal)
 			}
+			if !interrupted && strings.Count(terminal, "Progress:") != 2 {
+				t.Errorf("piped scan printed more than initial and final progress: %q", terminal)
+			}
 			after, err := unix.IoctlGetTermios(int(p.slave.Fd()), unix.TCGETS)
 			if err != nil || !reflect.DeepEqual(after, p.before) {
 				t.Errorf("progress changed terminal modes: %v", err)

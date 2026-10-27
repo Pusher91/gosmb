@@ -10,16 +10,16 @@ import (
 
 const clearProgressLine = "\r\x1b[2K"
 
-// Direct terminal output uses one updating line. Piped output uses occasional
-// plain lines without erasing or repositioning the pipe consumer's output.
+// Direct terminal output uses one updating line. Piped output prints only
+// initial and final counts, leaving the pipe consumer's output alone.
 type progressDisplay struct {
-	out        io.Writer
-	enabled    bool
-	total      int
-	visible    bool
-	lines      bool
-	lastUpdate time.Time
-	budget     progressBudget
+	out     io.Writer
+	enabled bool
+	total   int
+	visible bool
+	lines   bool
+	started bool
+	budget  progressBudget
 }
 
 type progressBudget struct {
@@ -118,14 +118,13 @@ func (p *progressDisplay) Update(completed int) error {
 		return nil
 	}
 	if p.lines {
-		now := time.Now()
-		if !p.lastUpdate.IsZero() && (completed >= p.total || now.Sub(p.lastUpdate) < time.Second) {
+		if p.started {
 			return nil
 		}
 		if err := p.write(p.liveLabel(completed)+"\n", false); err != nil {
 			return err
 		}
-		p.lastUpdate = now
+		p.started = true
 		return nil
 	}
 	return p.write(clearProgressLine+p.liveLabel(completed), true)

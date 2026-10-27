@@ -3,8 +3,9 @@
 - Defer CI, versioned releases, `--version`, licensing, and release notes for the
   foreseeable future. Do not implement or repeatedly recommend this work unless
   the user explicitly brings it back into scope.
-- README restructuring and editorial polish are also deferred. Focus on the
-  requested functional work.
+- Keep the README concise and focused on usage, accurate output examples, and
+  build instructions. Keep finished binaries in `builds/` eligible for Git;
+  ignore only temporary build staging directories there.
 - In text and TSV output, the `GUEST` column describes credential fallback.
   Explicit `--guest` scans display `N/A` in that column, including failed or
   timed-out scans. Keep JSON's `guest_fallback` Boolean semantics unchanged.
@@ -20,9 +21,9 @@
   of stdout, except that interrupted piped default-table output appends one
   plain progress summary unless `--no-progress` is set. Saving that summary is
   best effort because plain `tee` may also exit on Ctrl+C. TSV and JSON keep
-  their existing formats. Piped output uses occasional plain progress lines
-  on terminal stderr, without cursor-control sequences or terminal setup. Direct
-  terminal output keeps its updating progress line. Support plain `tee`
+  their existing formats. Piped output prints only initial and final progress
+  counts on terminal stderr, without cursor-control sequences or terminal setup.
+  Direct terminal output keeps its updating progress line. Support plain `tee`
   without special flags, synchronization, or signal handling for the reader.
   Terminal progress ends with a compact stderr summary of host outcomes and
   share permission counts. Honor `--no-progress` for both progress and summary.

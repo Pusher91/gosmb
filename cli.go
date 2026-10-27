@@ -39,8 +39,6 @@ Options (before or after the target):
       --no-progress     Hide progress and summary
   -h, --help            Show help
 
-Default: table output, including when piped through tee.
-
 Columns:
   TARGET_IP  Supplied or connected IP plus port; UNKNOWN:port if unavailable
              IPv6 endpoints use [IPv6]:port

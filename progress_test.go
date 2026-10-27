@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func TestProgressLinesThrottleOnlyIntermediateUpdates(t *testing.T) {
+func TestProgressLinesOnlyPrintInitialAndFinalCounts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var out bytes.Buffer
 		p := newProgress(&out, true, 10)
@@ -26,27 +26,12 @@ func TestProgressLinesThrottleOnlyIntermediateUpdates(t *testing.T) {
 		if out.String() != initial {
 			t.Fatalf("initial progress was not printed immediately: %q", out.String())
 		}
-		update(1)
-		time.Sleep(999 * time.Millisecond)
-		update(2)
-		if out.String() != initial {
-			t.Fatalf("intermediate progress exceeded one line per second: %q", out.String())
-		}
-		time.Sleep(time.Millisecond)
-		update(3)
-		beforeIdle := out.String()
-		if beforeIdle != initial+"Progress: 30% (3/10 hosts completed)\n" {
-			t.Fatalf("one-second boundary did not emit the current count: %q", beforeIdle)
-		}
-		time.Sleep(5 * time.Second)
-		if out.String() != beforeIdle {
-			t.Fatalf("idle progress wrote without an Update call: %q", out.String())
-		}
-		update(4)
-		time.Sleep(time.Second)
-		update(10)
-		if strings.Contains(out.String(), "100%") {
-			t.Fatalf("Update duplicated the final summary: %q", out.String())
+		for completed := 1; completed <= 10; completed++ {
+			time.Sleep(time.Minute)
+			update(completed)
+			if out.String() != initial {
+				t.Fatalf("intermediate progress cluttered piped output: %q", out.String())
+			}
 		}
 		beforeClear := out.String()
 		if err := p.Clear(); err != nil || out.String() != beforeClear {
@@ -55,10 +40,9 @@ func TestProgressLinesThrottleOnlyIntermediateUpdates(t *testing.T) {
 		if err := p.Finish(10, false); err != nil {
 			t.Fatal(err)
 		}
-		want := initial + "Progress: 30% (3/10 hosts completed)\n" +
-			"Progress: 40% (4/10 hosts completed)\nProgress: 100% (10/10 hosts completed)\n"
+		want := initial + "Progress: 100% (10/10 hosts completed)\n"
 		if out.String() != want {
-			t.Fatalf("line progress lost cadence, final count, or clean lines:\n%q\nwant %q", out.String(), want)
+			t.Fatalf("line progress lost initial/final counts or clean lines:\n%q\nwant %q", out.String(), want)
 		}
 	})
 }
@@ -147,7 +131,7 @@ func TestProgressLinesDisabledWritesNothing(t *testing.T) {
 }
 
 func TestProgressLinesPropagateWriteFailures(t *testing.T) {
-	for _, phase := range []string{"initial", "intermediate", "final"} {
+	for _, phase := range []string{"initial", "final"} {
 		for _, short := range []bool{false, true} {
 			name := phase + "/error"
 			if short {
@@ -173,9 +157,6 @@ func TestProgressLinesPropagateWriteFailures(t *testing.T) {
 						if err := p.Update(0); err != nil {
 							t.Fatal(err)
 						}
-					}
-					if phase == "intermediate" {
-						time.Sleep(time.Second)
 					}
 					before := len(writes)
 					fail = true

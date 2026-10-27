@@ -1049,7 +1049,7 @@ func TestCLIStreamsTextBeforeNextHostAndKeepsProgressOffStdout(t *testing.T) {
 					}
 					wantProgress := "Progress: 50% (1/2 hosts completed)"
 					if !mode.stdoutTTY {
-						wantProgress = "Progress: 0% (0/2 hosts completed)" // Subsequent pipe updates are rate-limited.
+						wantProgress = "Progress: 0% (0/2 hosts completed)" // Piped progress only prints initial and final counts.
 					}
 					if mode.progress && !strings.Contains(errOut.String(), wantProgress) {
 						t.Fatalf("live progress was not emitted while scanning: %q", errOut.String())
