@@ -39,14 +39,7 @@ Options (before or after the target):
       --no-progress     Hide progress and summary
   -h, --help            Show help
 
-The default table is preserved when piped (including through tee).
-Piped runs show occasional plain progress lines on terminal stderr.
-Terminal progress ends with host outcome and share totals.
-Interrupted table output attempts to append a plain progress summary unless
---no-progress is set; a pipe consumer may exit before saving it after Ctrl+C.
-Max ETA assumes each remaining target uses --host-timeout and includes the
-concurrency and launch delay; it excludes output stalls and scheduling overhead.
-Use --tsv for tab-separated data or --json for detailed error information.
+Default: table output, including when piped through tee.
 
 Columns:
   TARGET_IP  Supplied or connected IP plus port; UNKNOWN:port if unavailable
