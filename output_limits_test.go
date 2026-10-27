@@ -98,10 +98,10 @@ func TestInteractiveTruncationPreservesFullMachineOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := parseTestTSV(t, tsv.String())
-	wantHeader := "TARGET_IP|SHARE|READ|WRITE|GUEST|HOSTNAME"
-	wantRow := "[" + ip + "]:1445|" + strings.Repeat("共有", 40) + `\tfull-name` + "|TRUE|FALSE|FALSE|" + hostname
+	wantHeader := "TARGET_IP|SHARE|READ|WRITE|GUEST|STATUS|HOSTNAME"
+	wantRow := "[" + ip + "]:1445|" + strings.Repeat("共有", 40) + `\tfull-name` + "|TRUE|FALSE|FALSE|OK|" + hostname
 	if len(rows) != 2 || strings.Join(rows[0], "|") != wantHeader || strings.Join(rows[1], "|") != wantRow {
-		t.Fatalf("interactive truncation changed six-column TSV: %q", tsv.String())
+		t.Fatalf("interactive truncation changed full seven-column TSV: %q", tsv.String())
 	}
 	if strings.ContainsRune(tsv.String(), '\x1b') {
 		t.Fatal("interactive colors leaked into TSV")

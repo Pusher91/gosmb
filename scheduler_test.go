@@ -171,7 +171,7 @@ func TestSchedulerBoundsOverlapAndEmitsCompletionOrder(t *testing.T) {
 	}
 	done := make(chan int, 1)
 	go func() {
-		done <- runCLI(ctx, []string{path, "-u", "alice", "-p", "", "--concurrency", "2", "--delay", "0"}, deps)
+		done <- runCLI(ctx, []string{path, "-u", "alice", "-p", "", "--concurrency", "2", "--delay", "0", "--tsv"}, deps)
 	}()
 	firstTwo := map[string]bool{awaitSchedulerStart(t, ctx, started): true, awaitSchedulerStart(t, ctx, started): true}
 	if !firstTwo["first"] || !firstTwo["second"] || active.Load() != 2 {
@@ -214,7 +214,7 @@ func TestHostTimeoutReleasesSlotAndBudgetStartsWhenWorkerRuns(t *testing.T) {
 	path := schedulerHostFile(t, "slow", "queued")
 	out, errOut := &schedulerCapture{}, &schedulerCapture{}
 	deps := testCLIDeps(out, errOut)
-	deps.stderrIsTerminal = true
+	deps.stdoutIsTerminal, deps.stderrIsTerminal = true, true
 	const budget = time.Second
 	remaining := make(chan time.Duration, 1)
 	issues := make(chan string, 8)
@@ -276,7 +276,7 @@ func TestSchedulerCancellationStopsActiveWorkersAndQueuedStarts(t *testing.T) {
 	path := schedulerHostFile(t, "first", "second", "queued", "last")
 	out, errOut := &schedulerCapture{}, &schedulerCapture{}
 	deps := testCLIDeps(out, errOut)
-	deps.stderrIsTerminal = true
+	deps.stdoutIsTerminal, deps.stderrIsTerminal = true, true
 	started := make(chan string, 4)
 	var calls, active atomic.Int32
 	deps.scan = func(scanCtx context.Context, target Target, _ Options) Result {

@@ -48,7 +48,7 @@ func TestCLIProgressFailurePreservesBufferedJSON(t *testing.T) {
 				return len(data), nil
 			})
 			deps := testCLIDeps(&out, stderr)
-			deps.stderrIsTerminal = true
+			deps.stdoutIsTerminal, deps.stderrIsTerminal = true, true
 			deps.scan = func(_ context.Context, target Target, _ Options) Result {
 				scans++
 				if out.Len() != 0 {
@@ -146,7 +146,7 @@ func TestCLIProgressFailureDrainsConcurrentJSONResults(t *testing.T) {
 					return out.Write(data)
 				})
 				deps := testCLIDeps(stdout, stderr)
-				deps.stderrIsTerminal = true
+				deps.stdoutIsTerminal, deps.stderrIsTerminal = true, true
 				deps.scan = func(scanCtx context.Context, target Target, _ Options) Result {
 					switch target.Host {
 					case "first":

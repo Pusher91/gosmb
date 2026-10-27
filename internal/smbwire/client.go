@@ -97,11 +97,13 @@ func NewConnection(opts Options) (*Connection, error) {
 	}
 	wire, err := opts.Dial()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("TCP dial: %w", err)
 	}
 	c := &Connection{wire: wire, opts: opts, credits: 1, trees: make(map[string]*tree)}
-	if err = c.negotiate(); err == nil {
-		err = c.authenticate()
+	if err = c.negotiate(); err != nil {
+		err = fmt.Errorf("SMB negotiation: %w", err)
+	} else if err = c.authenticate(); err != nil {
+		err = fmt.Errorf("SMB authentication: %w", err)
 	}
 	// Credentials are only needed during the single initial exchange.
 	c.opts.Password, c.opts.Username, c.opts.Domain = "", "", ""
@@ -177,6 +179,11 @@ func (c *Connection) exchange(command uint16, treeID uint32, body []byte) (resul
 		return nil, net.ErrClosed
 	}
 	defer func() {
+		if failure := recover(); failure != nil {
+			// Stop nested cleanup from using a stream interrupted by a panic.
+			c.Close()
+			panic(failure)
+		}
 		if err == nil {
 			return
 		}

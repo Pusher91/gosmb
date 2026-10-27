@@ -33,11 +33,30 @@ func scanTarget(ctx context.Context, target Target, opts Options) (result Result
 	defer func() {
 		if recover() != nil {
 			wire.close()
-			result.Error = "invalid SMB response; scan aborted"
+			// A panic does not identify its cause. Keep its potentially sensitive
+			// value out of the report while preserving the per-host failure.
+			result.Error = "unexpected panic during SMB scan; scan aborted"
 			result.status = statusSMBFailed
 			if result.Enumeration == "not_attempted" {
 				result.Enumeration = "error"
 			}
+		}
+		stop()
+		wire.close()
+		result.Reachable = wire.reachable()
+		if result.ServerIP == "" {
+			result.ServerIP = wire.serverIP()
+		}
+		if wire.timedOut() {
+			markHostTimeout(&result)
+		}
+	}()
+	defer func() {
+		// A body panic must close the wire immediately, without trying more
+		// protocol operations. The outer defer records it and finalizes identity.
+		if failure := recover(); failure != nil {
+			wire.close()
+			panic(failure)
 		}
 		if conn != nil {
 			// A failed operation may already have closed the client. Otherwise,
@@ -52,15 +71,6 @@ func scanTarget(ctx context.Context, target Target, opts Options) (result Result
 					result.completionStatus = operationStatus(err, wire.err(), statusCleanupFailed, statusCleanupTimeout)
 				}
 			}
-		}
-		stop()
-		wire.close()
-		result.Reachable = wire.reachable()
-		if result.ServerIP == "" {
-			result.ServerIP = wire.serverIP()
-		}
-		if wire.timedOut() {
-			markHostTimeout(&result)
 		}
 	}()
 
@@ -129,9 +139,12 @@ func scanTarget(ctx context.Context, target Target, opts Options) (result Result
 		}
 		result.Error = fmt.Sprintf("share enumeration: %v", err)
 	}
-	// Preserve any successfully enumerated page even if a later page failed.
-	result.Shares = make([]ShareResult, 0, len(shares))
-	for _, share := range shares {
+	// Preserve the whole discovered list even if a later check aborts the scan.
+	result.Shares = make([]ShareResult, len(shares))
+	for i, share := range shares {
+		result.Shares[i] = unprobedShare(share, "")
+	}
+	for i, share := range shares {
 		if err := wire.err(); err != nil {
 			if result.Error == "" {
 				result.Error = "share checks incomplete: " + err.Error()
@@ -140,11 +153,11 @@ func scanTarget(ctx context.Context, target Target, opts Options) (result Result
 			if !unprobed.probeComplete {
 				unprobed.status = operationStatus(err, nil, statusCheckFailed, statusCheckTimeout)
 			}
-			result.Shares = append(result.Shares, unprobed)
+			result.Shares[i] = unprobed
 			continue
 		}
 		inspected, cleanupErr := inspectShare(conn, wire, share)
-		result.Shares = append(result.Shares, inspected)
+		result.Shares[i] = inspected
 		if cleanupErr != nil && result.Error == "" {
 			result.Error = fmt.Sprintf("share %s cleanup: %v", share.Name, cleanupErr)
 		}

@@ -32,12 +32,21 @@ Options (before or after the target):
       --concurrency N   Parallel hosts (default: 1)
       --host-timeout N  Per-host limit in seconds (default: 30)
       --timeout TIME    SMB I/O timeout (default: 10s)
-      --delay TIME      Minimum time between starting host scans (default: 250ms; 0 disables)
+      --delay TIME      Minimum time between starting host scans (default: 0; no delay)
       --json            JSON output
-      --tsv             Force TSV (automatic when piped)
+      --tsv             Tab-separated output with full values
       --no-header       Omit text header
-      --no-progress     Hide progress
+      --no-progress     Hide progress and summary
   -h, --help            Show help
+
+The default table is preserved when piped (including through tee).
+Piped runs show occasional plain progress lines on terminal stderr.
+Terminal progress ends with host outcome and share totals.
+Interrupted table output attempts to append a plain progress summary unless
+--no-progress is set; a pipe consumer may exit before saving it after Ctrl+C.
+Max ETA assumes each remaining target uses --host-timeout and includes the
+concurrency and launch delay; it excludes output stalls and scheduling overhead.
+Use --tsv for tab-separated data or --json for detailed error information.
 
 Columns:
   TARGET_IP  Supplied or connected IP plus port; UNKNOWN:port if unavailable
@@ -47,7 +56,7 @@ Columns:
   WRITE      Permission to add files at root (metadata only; no write test)
   GUEST      TRUE when supplied credentials are accepted as Guest
              N/A when --guest is used
-  STATUS     Scan outcome in the interactive table only; codes below
+  STATUS     Scan outcome; codes below
   HOSTNAME   Supplied hostname; - for literal IP targets (no reverse DNS)
 
 READ/WRITE statuses (text output):
@@ -57,7 +66,7 @@ READ/WRITE statuses (text output):
   TIMEOUT  Check timed out
   N/A      Not applicable (non-disk share)
 
-STATUS codes (interactive table):
+STATUS codes (table and TSV):
 `
 
 var usage = usageIntro + statusHelp()
@@ -133,7 +142,7 @@ func helpRequested(args []string) bool {
 // credential must not be repeated in an error message.
 func parseCLI(ctx context.Context, args []string) (cliConfig, error) {
 	cfg := cliConfig{options: Options{Timeout: 10 * time.Second, HostTimeout: 30 * time.Second},
-		delay: 250 * time.Millisecond, concurrency: 1, help: helpRequested(args)}
+		delay: 0, concurrency: 1, help: helpRequested(args)}
 	if cfg.help {
 		return cfg, nil
 	}
@@ -360,8 +369,8 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 	if cfg.json {
 		results = make([]Result, 0, len(cfg.targets))
 	}
-	aligned := deps.stdoutIsTerminal && !cfg.tsv && !cfg.json
-	colored := aligned && deps.enableColor != nil
+	aligned := !cfg.tsv && !cfg.json
+	colored := aligned && deps.stdoutIsTerminal && deps.enableColor != nil
 	showProgress := deps.stderrIsTerminal && !cfg.noProgress
 	if (colored || showProgress) && deps.lookupEnv != nil {
 		terminal, _ := deps.lookupEnv("TERM")
@@ -385,6 +394,44 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 			return writeAlignedResult(out, result, colored)
 		}
 	}
+	if showProgress && deps.stdoutIsTerminal && deps.enableProgress != nil {
+		var restore func()
+		restore, showProgress = deps.enableProgress()
+		if restore != nil {
+			// Finish progress before restoring stderr, then restore stdout.
+			// The handles may refer to the same Windows console buffer.
+			defer restore()
+		}
+	}
+	var summary scanSummary
+	scanStarted := false
+	progress := newProgress(deps.stderr, showProgress, len(cfg.targets))
+	progress.SetScanBudget(cfg.concurrency, cfg.options.HostTimeout, cfg.delay)
+	pipedProgress := showProgress && !deps.stdoutIsTerminal
+	if !deps.stdoutIsTerminal {
+		progress.UseLines()
+	}
+	defer func() {
+		interrupted := ctx.Err() != nil
+		if interrupted && aligned && !deps.stdoutIsTerminal && !cfg.noProgress {
+			// Keep the interruption record after the rows in the same stream.
+			// This is best effort: the reader may also have exited on Ctrl+C.
+			_, _ = writeOutputString(deps.stdout, progress.label(summary.completed)+" (interrupted)\n")
+			code = 1
+		} else if err := progress.Finish(summary.completed, interrupted); err != nil {
+			code = 1
+		}
+		if showProgress && scanStarted {
+			if err := summary.Print(deps.stderr, len(cfg.targets)); err != nil {
+				code = 1
+			}
+		}
+		// Output writers can observe cancellation during final progress or
+		// summary output, after the interruption check above.
+		if ctx.Err() != nil {
+			code = 1
+		}
+	}()
 	if !cfg.json && !cfg.noHeader {
 		writeHeader := writeTextHeader
 		if aligned {
@@ -395,47 +442,26 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 			return 1
 		}
 	}
-	if showProgress && deps.enableProgress != nil {
-		var restore func()
-		restore, showProgress = deps.enableProgress()
-		if restore != nil {
-			// Finish the footer before restoring stderr, then restore stdout.
-			// The handles may refer to the same Windows console buffer.
-			defer restore()
-		}
-	}
-	completed := 0
-	progress := newProgress(deps.stderr, showProgress, len(cfg.targets))
-	defer func() {
-		if err := progress.Finish(completed, ctx.Err() != nil); err != nil || ctx.Err() != nil {
-			code = 1
-		}
-	}()
-	if err := progress.Update(completed); err != nil {
+	if err := progress.Update(summary.completed); err != nil {
 		return 1
 	}
-	scanCtx := ctx
-	var stopScan context.CancelFunc
-	if cfg.json && showProgress {
-		scanCtx, stopScan = context.WithCancel(ctx)
-		defer stopScan()
-	}
-	progressFailed := false
-	handleProgressError := func(err error) error {
-		if err == nil || stopScan == nil {
-			return err
+	scanCtx, stopScan := context.WithCancel(ctx)
+	defer stopScan()
+	outputFailed := false
+	handleOutputError := func(err error) error {
+		if err != nil {
+			// Stop new work but drain active and buffered results for accurate
+			// attempt totals and JSON. An emitter error would discard them.
+			outputFailed, code = true, 1
+			stopScan()
 		}
-		// Stop new work but keep collecting active and buffered JSON results.
-		// Returning an emitter error would make the scheduler discard them.
-		progressFailed, code = true, 1
-		stopScan()
 		return nil
 	}
+	scanStarted = true
 	scanErr := scanTargets(scanCtx, cfg.targets, cfg.options, cfg.concurrency, cfg.delay, deps.scan, func(result Result, hostCompleted bool) error {
 		result.explicitGuest = cfg.options.Guest
-		if hostCompleted {
-			completed++
-		} else {
+		summary.Add(result, hostCompleted)
+		if !hostCompleted {
 			code = 1
 		}
 		authenticationOK := result.Authentication == "authenticated" || result.Authentication == "guest"
@@ -449,29 +475,24 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 		if cfg.json {
 			// Keep completed work even if the separate progress stream fails.
 			results = append(results, result)
-			if progressFailed {
-				return nil
-			}
+		}
+		if outputFailed {
+			return nil
 		}
 		if err := progress.Clear(); err != nil {
-			return handleProgressError(err)
+			return handleOutputError(err)
 		}
 		if !cfg.json {
 			if err := writeResult(deps.stdout, result); err != nil {
 				fmt.Fprintln(deps.stderr, "gosmb: could not write output")
-				return err
-			}
-			if !aligned {
-				if err := writeTextDiagnostics(deps.stderr, result); err != nil {
-					return err
-				}
+				return handleOutputError(err)
 			}
 		}
-		return handleProgressError(progress.Update(completed))
+		return handleOutputError(progress.Update(summary.completed))
 	})
 	if scanErr != nil {
 		code = 1
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && !pipedProgress {
 			if err := progress.Clear(); err == nil {
 				fmt.Fprintln(deps.stderr, "gosmb: canceled")
 			}

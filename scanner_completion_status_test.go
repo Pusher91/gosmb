@@ -61,8 +61,8 @@ func TestDeadlineAfterSuccessfulLogoffReportsScanTimeout(t *testing.T) {
 				if len(fields) != 7 || fields[2] != readText || fields[3] != writeText || fields[4] != "FALSE" || fields[5] != wantStatus {
 					t.Errorf("interactive row lost permissions or completion status: %q", rows[i])
 				}
-				if machineRows[i][2] != readText || machineRows[i][3] != writeText || machineRows[i][4] != "FALSE" {
-					t.Errorf("late timeout changed TSV permissions or guest fallback: %q", machineRows[i])
+				if machineRows[i][2] != readText || machineRows[i][3] != writeText || machineRows[i][4] != "FALSE" || machineRows[i][5] != wantStatus {
+					t.Errorf("late timeout changed TSV permissions, guest fallback, or completion status: %q", machineRows[i])
 				}
 			}
 			fixture.assertUnchanged(t, 1)

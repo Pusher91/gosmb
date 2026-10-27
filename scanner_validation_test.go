@@ -27,7 +27,7 @@ func TestShareNameAllowsDELAndC1WithEscapedOutput(t *testing.T) {
 			if err := writeTextResult(&output, result); err != nil {
 				t.Fatal(err)
 			}
-			want := "192.0.2.1:445\t" + tc.escaped + "\tTRUE\tFALSE\tFALSE\t-\n"
+			want := "192.0.2.1:445\t" + tc.escaped + "\tTRUE\tFALSE\tFALSE\tOK\t-\n"
 			if output.String() != want {
 				t.Errorf("text result = %q; want %q", output.String(), want)
 			}

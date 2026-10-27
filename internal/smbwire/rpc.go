@@ -67,7 +67,7 @@ func newRPCClient(pipe rpcPipe) *rpcClient {
 // Writes carry RPC messages to the existing srvsvc pipe, never to disk files.
 func (c *Connection) EnumerateShares() (result ShareEnumeration, err error) {
 	if err = c.TreeConnect("IPC$"); err != nil {
-		return result, err
+		return result, fmt.Errorf("connect IPC$: %w", err)
 	}
 	var pipe *File
 	defer func() {
@@ -85,13 +85,16 @@ func (c *Connection) EnumerateShares() (result ShareEnumeration, err error) {
 	}()
 	pipe, err = c.openPipe()
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("open srvsvc pipe: %w", err)
 	}
 	rpc := newRPCClient(pipe)
 	if err = rpc.bind(); err != nil {
-		return result, err
+		return result, fmt.Errorf("bind srvsvc RPC: %w", err)
 	}
 	result.Shares, err = enumeratePages(c.opts.Host, func(body []byte) ([]byte, error) { return rpc.call(15, body) })
+	if err != nil {
+		err = fmt.Errorf("NetrShareEnum: %w", err)
+	}
 	result.Complete = err == nil
 	return result, err
 }

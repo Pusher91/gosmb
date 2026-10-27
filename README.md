@@ -48,9 +48,9 @@ queries the existing `srvsvc` RPC service for share names, and checks each
 returned disk share in sequence. There is no guessed-share probing, automatic
 guest retry, credential-cache use, or connection to DFS referrals. By default,
 one host is scanned at a time. `--concurrency=N` permits up to N simultaneous
-host scans, each with its own connection. The minimum interval between starting
-hosts is 250 ms across all workers (`--delay=0` disables it). Authentication
-failures are not retried.
+host scans, each with its own connection. There is no launch delay by default;
+`--delay=250ms`, for example, sets a minimum interval between starting hosts
+across all workers. Authentication failures are not retried.
 
 Resolved addresses are tried serially until one TCP connection succeeds;
 IPv4/IPv6 connections are not raced in parallel. DNS resolution and connection
@@ -117,26 +117,39 @@ example, `[2001:db8::10]:445` or `UNKNOWN:1445`. The original hostname stays
 visible in `HOSTNAME` even when the connection fails or resolves to an IP.
 JSON keeps the requested endpoint and server IP in separate fields.
 
-A live footer beneath the output shows, for example,
-`Progress: 50% (2/4 hosts completed)`. It starts at 0% and updates after each
-host, including hosts that fail connection or authentication or time out.
+Direct terminal runs use an updating progress line, for example,
+`Progress: 50% (2/4 hosts completed)`. Piped runs use plain progress lines,
+updated at most once per second as results arrive, with initial and final counts.
+Hosts that fail connection or authentication or time out count as completed.
 A host interrupted by canceling the command mid-check is not counted as completed;
 any partial results returned for that
 host are still printed. Ctrl-C/SIGTERM leaves the current counts marked
-`(interrupted)`. Progress only redraws its own line; previous results remain in
-terminal scrollback. A second Ctrl-C/SIGTERM terminates immediately if orderly
+`(interrupted)`. Piped progress uses no cursor-control sequences or line erasure;
+stdout and stderr can still arrive in different orders.
+A second Ctrl-C/SIGTERM terminates immediately if orderly
 shutdown stalls, including when output is blocked. A force kill cannot print a
 final status but does not erase already printed rows.
 
-The footer goes to stderr only when stderr is a terminal, keeping TSV and JSON
-clean. Use `--no-progress` to hide it. Redirected stderr has diagnostics without
-progress or cursor-control sequences. JSON remains a single array written on
+Progress goes to stderr only when stderr is a terminal, keeping TSV and JSON
+clean. It ends with a compact summary of completed/interrupted hosts, host status
+counts, and discovered/readable/writable shares. Each host counts once: primary
+host failures take precedence, followed by the first failed share check, then
+cleanup or final scan-timeout status.
+Writable counts use permission metadata; no write test is performed.
+Use `--no-progress` to hide both progress
+and this summary. Redirected stderr has diagnostics without progress, summary,
+or cursor-control sequences. JSON remains a single array written on
 completion or orderly cancellation; use the default text/TSV for immediate rows.
+
+Interrupted piped default-table output attempts to append one plain progress
+summary after the result rows, unless `--no-progress` is set. With ordinary
+`tee`, saving that summary is best effort because Ctrl-C can also stop the reader.
+Normal runs do not save progress; TSV and JSON keep their formats.
 
 There is one header per run and one logical row per share. There are no borders,
 horizontal lines, repeated headers, banners,
-blank separator lines, or explanatory text on stdout. `--no-header` emits data
-rows only. Failed/empty servers remain visible with a `-` share and `UNKNOWN`
+blank separator lines, or explanatory text on stdout during normal scans.
+`--no-header` omits the column header. Failed/empty servers remain visible with a `-` share and `UNKNOWN`
 permissions, or `TIMEOUT` when a timeout prevents the checks;
 diagnostic details go to stderr. If guest enumeration is denied,
 the row still records that fallback occurred; no share names are guessed.

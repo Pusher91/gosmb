@@ -30,7 +30,7 @@ func TestParseCLIFlagsAfterTarget(t *testing.T) {
 
 func TestCLIConcurrencyAndHostTimeoutOptions(t *testing.T) {
 	cfg, err := parseCLI(context.Background(), []string{"server", "--guest"})
-	if err != nil || cfg.concurrency != 1 || cfg.options.HostTimeout != 30*time.Second || cfg.options.Timeout != 10*time.Second {
+	if err != nil || cfg.delay != 0 || cfg.concurrency != 1 || cfg.options.HostTimeout != 30*time.Second || cfg.options.Timeout != 10*time.Second {
 		t.Fatalf("unexpected scheduler defaults: %#v %v", cfg, err)
 	}
 	for _, args := range [][]string{
@@ -266,6 +266,8 @@ func TestCLIAbsoluteHostnameReachesScanAndOutputUnchanged(t *testing.T) {
 		args := []string{endpoint, "--guest", "--no-header"}
 		if jsonOutput {
 			args = append(args, "--json")
+		} else {
+			args = append(args, "--tsv")
 		}
 		if code := runCLI(context.Background(), args, deps); code != 0 {
 			t.Fatalf("absolute hostname scan failed: exit=%d diagnostics=%q", code, diagnostics.String())
@@ -275,7 +277,7 @@ func TestCLIAbsoluteHostnameReachesScanAndOutputUnchanged(t *testing.T) {
 			if err := json.Unmarshal(out.Bytes(), &results); err != nil || len(results) != 1 || results[0].Target != endpoint {
 				t.Fatalf("JSON lost the supplied absolute endpoint: %q (%v)", out.String(), err)
 			}
-		} else if rows := parseTestTSV(t, out.String()); len(rows) != 1 || rows[0][5] != hostname {
+		} else if rows := parseTestTSV(t, out.String()); len(rows) != 1 || rows[0][6] != hostname {
 			t.Fatalf("text lost the supplied absolute hostname: %q", out.String())
 		}
 	}
@@ -538,7 +540,8 @@ func TestCLICancellationDuringFinalOutputReturnsFailure(t *testing.T) {
 					return out.Write(data)
 				})
 			} else {
-				deps.stderrIsTerminal = true
+				deps.stdoutIsTerminal, deps.stderrIsTerminal = true, true
+				args = append(args, "--tsv")
 				deps.stderr = outputWriteFunc(func(data []byte) (int, error) {
 					if bytes.Contains(data, []byte("Progress:")) && bytes.HasSuffix(data, []byte{'\n'}) {
 						cancel()
@@ -756,14 +759,13 @@ func TestGuestExitCodesRequireSuccessfulEnumeration(t *testing.T) {
 				if !tt.guest {
 					args = []string{"host", "-u", "alice", "-p", "", "--no-header"}
 				}
+				if format.name == "TSV" {
+					args = append(args, "--tsv")
+				}
 				if code := runCLI(context.Background(), args, deps); code != tt.want || calls != 1 {
 					t.Fatalf("code=%d calls=%d, want code=%d and one call", code, calls, tt.want)
 				}
-				columns := 6
-				if format.terminal {
-					columns = 7
-				}
-				if fields := strings.Fields(out.String()); len(fields) != columns || fields[4] != tt.guestCell {
+				if fields := strings.Fields(out.String()); len(fields) != 7 || fields[4] != tt.guestCell {
 					t.Fatalf("guest column = %q; want %q", out.String(), tt.guestCell)
 				}
 			})
@@ -782,9 +784,9 @@ func TestHelpExplainsColumnsAndAccessStatuses(t *testing.T) {
 			t.Errorf("help missing output explanation %q", expected)
 		}
 	}
-	for _, expected := range []string{"STATUS", "Scan outcome in the interactive table only", "STATUS codes (interactive table):"} {
+	for _, expected := range []string{"STATUS", "Scan outcome; codes below", "STATUS codes (table and TSV):"} {
 		if !strings.Contains(out.String(), expected) {
-			t.Errorf("help missing interactive table explanation %q", expected)
+			t.Errorf("help missing text status explanation %q", expected)
 		}
 	}
 	for _, label := range statusLabels[1:] {
@@ -889,17 +891,17 @@ func TestCLITerminalAlignsSevenColumnsAcrossServers(t *testing.T) {
 	}
 }
 
-func TestCLIProducesOneTSVHeaderAndSendsDiagnosticsToStderr(t *testing.T) {
+func TestCLIProducesOneTSVHeaderWithStatusesAndNoScanDiagnostics(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hosts")
 	if err := os.WriteFile(path, []byte("first:1445\nsecond\nthird\nmissing:3445\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	const header = "TARGET_IP\tSHARE\tREAD\tWRITE\tGUEST\tHOSTNAME\n"
-	const data = "192.0.2.1:1445\tpublic data\tTRUE\tUNKNOWN\tFALSE\tfirst\n" +
-		"192.0.2.1:1445\tprivate\tFALSE\tFALSE\tFALSE\tfirst\n" +
-		"192.0.2.2:445\t-\tUNKNOWN\tUNKNOWN\tFALSE\tsecond\n" +
-		"192.0.2.3:445\t-\tUNKNOWN\tUNKNOWN\tFALSE\tthird\n" +
-		"UNKNOWN:3445\t-\tUNKNOWN\tUNKNOWN\tFALSE\tmissing\n"
+	const header = "TARGET_IP\tSHARE\tREAD\tWRITE\tGUEST\tSTATUS\tHOSTNAME\n"
+	const data = "192.0.2.1:1445\tpublic data with a complete long share name\tTRUE\tUNKNOWN\tFALSE\tCHECK_FAILED\tfirst\n" +
+		"192.0.2.1:1445\tprivate\tFALSE\tFALSE\tFALSE\tOK\tfirst\n" +
+		"192.0.2.2:445\t-\tUNKNOWN\tUNKNOWN\tFALSE\tAUTH_FAILED\tsecond\n" +
+		"192.0.2.3:445\t-\tUNKNOWN\tUNKNOWN\tFALSE\tNO_SHARES\tthird\n" +
+		"UNKNOWN:3445\t-\tUNKNOWN\tUNKNOWN\tFALSE\tCONNECT_FAILED\tmissing\n"
 	for _, mode := range []string{"header", "no-header-before", "no-header-after", "forced-tsv-terminal", "forced-tsv-terminal-no-header"} {
 		t.Run(mode, func(t *testing.T) {
 			var out, errOut bytes.Buffer
@@ -908,7 +910,7 @@ func TestCLIProducesOneTSVHeaderAndSendsDiagnosticsToStderr(t *testing.T) {
 				switch target.Host {
 				case "first":
 					return Result{Target: target.String(), ServerIP: "192.0.2.1", Reachable: true, Authentication: "authenticated", Enumeration: "ok", Shares: []ShareResult{
-						{Name: "public data", Accessible: Allowed, Read: Allowed, Write: Unknown, Comment: "comments stay out of TSV"},
+						{Name: "public data with a complete long share name", Accessible: Allowed, Read: Allowed, Write: Unknown, Comment: "comments stay out of TSV", Error: "root maximum-access metadata unavailable"},
 						{Name: "private", Accessible: Denied, Read: Denied, Write: Denied, Error: "root listing denied"},
 					}}
 				case "second":
@@ -919,18 +921,17 @@ func TestCLIProducesOneTSVHeaderAndSendsDiagnosticsToStderr(t *testing.T) {
 					return Result{Target: target.String(), ServerIP: "192.0.2.3", Reachable: true, Authentication: "authenticated", Enumeration: "ok"}
 				}
 			}
-			args := []string{path, "-u", "alice", "-p", "do-not-leak-password", "--delay", "0"}
+			args := []string{path, "-u", "alice", "-p", "do-not-leak-password", "--delay", "0", "--tsv"}
 			want := data
 			switch mode {
 			case "header":
 				want = header + data
 			case "forced-tsv-terminal":
 				deps.stdoutIsTerminal = true
-				args = append(args, "--tsv")
 				want = header + data
 			case "forced-tsv-terminal-no-header":
 				deps.stdoutIsTerminal = true
-				args = append(args, "--tsv", "--no-header")
+				args = append(args, "--no-header")
 			case "no-header-before":
 				args = append([]string{"--no-header"}, args...)
 			case "no-header-after":
@@ -943,10 +944,8 @@ func TestCLIProducesOneTSVHeaderAndSendsDiagnosticsToStderr(t *testing.T) {
 				t.Fatalf("stdout has repeated headers, missing rows, or non-TSV content:\n%q\nwant:\n%q", out.String(), want)
 			}
 			parseTestTSV(t, out.String())
-			for _, message := range []string{"root listing denied", "login failed", "no shares returned", "name resolution failed"} {
-				if strings.Count(strings.ToLower(errOut.String()), message) != 1 {
-					t.Errorf("diagnostic %q must appear once on stderr: %q", message, errOut.String())
-				}
+			if errOut.Len() != 0 {
+				t.Errorf("TSV duplicated scan outcomes on stderr: %q", errOut.String())
 			}
 			if strings.Contains(out.String()+errOut.String(), "do-not-leak-password") || strings.Contains(errOut.String(), "comments stay out") {
 				t.Fatal("secret or unused share comments appeared in output")
@@ -1025,7 +1024,9 @@ func TestCLIStreamsTextBeforeNextHostAndKeepsProgressOffStdout(t *testing.T) {
 		json, progress       bool
 	}{
 		{"terminal", "", true, true, false, true},
-		{"tsv", "", false, true, false, true},
+		{"piped-table", "", false, true, false, true},
+		{"piped-tsv", "--tsv", false, true, false, true},
+		{"piped-json", "--json", false, true, true, true},
 		{"forced-tsv", "--tsv", true, true, false, true},
 		{"json", "--json", true, true, true, true},
 		{"redirected-stderr", "", true, false, false, false},
@@ -1046,8 +1047,12 @@ func TestCLIStreamsTextBeforeNextHostAndKeepsProgressOffStdout(t *testing.T) {
 					} else if !strings.HasSuffix(out.String(), "first\n") {
 						t.Fatalf("streamed result did not retain the supplied hostname in the last column: %q", out.String())
 					}
-					if mode.progress && !strings.Contains(errOut.String(), "Progress: 50% (1/2 hosts completed)") {
-						t.Fatalf("live progress does not show the completed first host: %q", errOut.String())
+					wantProgress := "Progress: 50% (1/2 hosts completed)"
+					if !mode.stdoutTTY {
+						wantProgress = "Progress: 0% (0/2 hosts completed)" // Subsequent pipe updates are rate-limited.
+					}
+					if mode.progress && !strings.Contains(errOut.String(), wantProgress) {
+						t.Fatalf("live progress was not emitted while scanning: %q", errOut.String())
 					}
 				}
 				return Result{Target: target.String(), ServerIP: "192.0.2.1", Reachable: true, Authentication: "authenticated", Enumeration: "ok", Shares: []ShareResult{{Name: target.Host + "-share", Read: Allowed, Write: Denied}}}
@@ -1063,7 +1068,7 @@ func TestCLIStreamsTextBeforeNextHostAndKeepsProgressOffStdout(t *testing.T) {
 				t.Fatalf("progress corrupted stdout: %q", out.String())
 			}
 			if mode.progress {
-				if !strings.Contains(errOut.String(), "Progress: 100% (2/2 hosts completed)") || !strings.HasSuffix(errOut.String(), "\n") {
+				if !strings.Contains(errOut.String(), "Progress: 100% (2/2 hosts completed)") || mode.stdoutTTY && !strings.HasSuffix(errOut.String(), "\n") {
 					t.Fatalf("missing final progress count/newline: %q", errOut.String())
 				}
 			} else if errOut.Len() != 0 {
@@ -1074,10 +1079,12 @@ func TestCLIStreamsTextBeforeNextHostAndKeepsProgressOffStdout(t *testing.T) {
 				if err := json.Unmarshal(out.Bytes(), &results); err != nil || len(results) != 2 {
 					t.Fatalf("progress corrupted JSON: %v %q", err, out.String())
 				}
-			} else if !mode.stdoutTTY || mode.flag == "--tsv" {
+			} else if mode.flag == "--tsv" {
 				if rows := parseTestTSV(t, out.String()); len(rows) != 3 {
 					t.Fatalf("streaming TSV lost records: %#v", rows)
 				}
+			} else if strings.ContainsRune(out.String(), '\t') || strings.Count(out.String(), "\n") != 3 {
+				t.Fatalf("streaming default table lost aligned records: %q", out.String())
 			}
 		})
 	}

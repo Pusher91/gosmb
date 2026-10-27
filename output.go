@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"iter"
 	"net"
@@ -16,27 +15,18 @@ import (
 	"github.com/rivo/uniseg"
 )
 
-// displayText escapes terminal controls before optional truncation. A negative
-// limit preserves the full value; otherwise the rune limit includes any
-// ellipsis. Truncation never splits runes or escapes.
-func displayText(s string, limit int) string {
-	if limit == 0 {
-		return ""
-	}
+// displayText escapes terminal controls and preserves the full value. Only
+// alignedCell truncates output, using terminal width rather than rune count.
+func displayText(s string) string {
 	// Ordinary output cells need no copy. Most share names and every fixed
 	// permission cell take this path; escaping still handles all Unicode controls.
-	if (limit < 0 || utf8.RuneCountInString(s) <= limit) && utf8.ValidString(s) && strings.IndexFunc(s, needsDisplayEscape) < 0 {
+	if utf8.ValidString(s) && strings.IndexFunc(s, needsDisplayEscape) < 0 {
 		return s
 	}
 	var b strings.Builder
-	capacity := len(s)
-	if limit >= 0 {
-		capacity = min(capacity, limit)
-	}
-	b.Grow(capacity)
+	b.Grow(len(s))
 	var escape [10]byte // Longest escape: \U followed by eight hexadecimal digits.
 	escape[0] = '\\'
-	count := 0
 	for len(s) > 0 {
 		r, size := utf8.DecodeRuneInString(s)
 		s = s[size:]
@@ -64,22 +54,11 @@ func displayText(s string, limit int) string {
 				}
 			}
 		}
-		if limit >= 0 {
-			remaining := limit - count
-			if len(s) > 0 {
-				remaining-- // Reserve the ellipsis until the final rune fits.
-			}
-			if width > remaining {
-				b.WriteRune('…')
-				break
-			}
-		}
 		if width == 1 {
 			b.WriteRune(r)
 		} else {
 			b.Write(escape[:width])
 		}
-		count += width
 	}
 	return b.String()
 }
@@ -143,15 +122,21 @@ func redactResult(r Result, password string) Result {
 	return r
 }
 
+var textHeader = [7]string{"TARGET_IP", "SHARE", "READ", "WRITE", "GUEST", "STATUS", "HOSTNAME"}
+
+// Fixed terminal-cell limits let each host print immediately without moving
+// later columns. Zero leaves only the final hostname column unbounded.
+var alignedWidths = [7]int{21, 20, 7, 7, 7, 18, 0}
+
 func writeTextHeader(out io.Writer) error {
-	_, err := writeOutputString(out, "TARGET_IP\tSHARE\tREAD\tWRITE\tGUEST\tHOSTNAME\n")
+	_, err := writeOutputString(out, strings.Join(textHeader[:], "\t")+"\n")
 	return err
 }
 
 // Each cell is one complete, untruncated field. Escape literal backslashes
 // before control characters so a real tab differs from a literal backslash-t.
 func tsvCell(value string) string {
-	return displayText(strings.ReplaceAll(value, `\`, `\\`), -1)
+	return displayText(strings.ReplaceAll(value, `\`, `\\`))
 }
 
 // lineOutputBuffer bounds retained output independently of the share count.
@@ -200,7 +185,7 @@ func writeTextResult(out io.Writer, r Result) error {
 
 // Yield one row at a time so a host's entire escaped share list is not retained
 // alongside its rendered output. The endpoint and hostname are shared by rows.
-func textResultRows(r Result) iter.Seq[[6]string] {
+func textResultRows(r Result) iter.Seq[[7]string] {
 	targetIP, hostname := r.ServerIP, "-"
 	host, port, splitErr := net.SplitHostPort(r.Target)
 	if splitErr != nil {
@@ -232,8 +217,8 @@ func textResultRows(r Result) iter.Seq[[6]string] {
 			guestFallback = "TIMEOUT"
 		}
 	}
-	base := [6]string{tsvCell(targetIP), "", "", "", guestFallback, tsvCell(hostname)}
-	return func(yield func([6]string) bool) {
+	base := [7]string{tsvCell(targetIP), "", "", "", guestFallback, "", tsvCell(hostname)}
+	return func(yield func([7]string) bool) {
 		fields := base
 		if len(r.Shares) == 0 {
 			permission := Unknown
@@ -243,13 +228,16 @@ func textResultRows(r Result) iter.Seq[[6]string] {
 				permission = TimedOut
 			}
 			fields[1], fields[2], fields[3] = "-", displayPermission(permission), displayPermission(permission)
+			fields[5] = tableStatus(r, nil)
 			yield(fields)
 			return
 		}
-		for _, share := range r.Shares {
+		for i := range r.Shares {
+			share := &r.Shares[i]
 			fields[1] = tsvCell(share.Name)
 			fields[2] = displayPermission(share.Read)
 			fields[3] = displayPermission(share.Write)
+			fields[5] = tableStatus(r, share)
 			if !yield(fields) {
 				return
 			}
@@ -257,27 +245,16 @@ func textResultRows(r Result) iter.Seq[[6]string] {
 	}
 }
 
-// Fixed terminal-cell limits let each host print immediately without moving
-// later columns. Zero leaves only the final hostname column unbounded.
-var alignedWidths = [7]int{21, 20, 7, 7, 7, 18, 0}
-
 func writeAlignedHeader(out io.Writer) error {
-	return writeAlignedRow(out, [7]string{"TARGET_IP", "SHARE", "READ", "WRITE", "GUEST", "STATUS", "HOSTNAME"}, false)
+	return writeAlignedRow(out, textHeader, false)
 }
 
 func writeAlignedResult(out io.Writer, result Result, colored bool) error {
 	b := lineOutputBuffer{out: out}
-	i := 0
-	for row := range textResultRows(result) {
-		var share *ShareResult
-		if i < len(result.Shares) {
-			share = &result.Shares[i]
-		}
-		fields := [7]string{row[0], row[1], row[2], row[3], row[4], tableStatus(result, share), row[5]}
+	for fields := range textResultRows(result) {
 		if err := appendAlignedRow(&b, fields, colored); err != nil {
 			return err
 		}
-		i++
 	}
 	return b.flush()
 }
@@ -304,7 +281,7 @@ func alignedCell(value string, limit int) (string, int) {
 			return value[:limit-1] + "…", limit
 		}
 	}
-	value = displayText(value, -1)
+	value = displayText(value)
 	if limit == 0 {
 		return value, uniseg.StringWidth(value)
 	}
@@ -410,34 +387,6 @@ func appendAlignedRow(b *lineOutputBuffer, fields [7]string, colored bool) error
 		b.WriteString(strings.Repeat(" ", padding[i]))
 	}
 	return b.endLine()
-}
-
-// TSV status explanations go to stderr, leaving stdout as a stable data stream.
-// The interactive table presents these outcomes in its STATUS column instead.
-func writeTextDiagnostics(out io.Writer, r Result) error {
-	b := lineOutputBuffer{out: out}
-	target := displayText(r.Target, 256)
-	if r.Error != "" {
-		fmt.Fprintf(&b, "gosmb: %s: %s", target, displayText(r.Error, 500))
-		if err := b.endLine(); err != nil {
-			return err
-		}
-	}
-	for _, s := range r.Shares {
-		if s.Error != "" {
-			fmt.Fprintf(&b, "gosmb: %s: %s: %s", target, displayText(s.Name, 256), displayText(s.Error, 500))
-			if err := b.endLine(); err != nil {
-				return err
-			}
-		}
-	}
-	if len(r.Shares) == 0 && r.Enumeration == "ok" {
-		fmt.Fprintf(&b, "gosmb: %s: no shares returned", target)
-		if err := b.endLine(); err != nil {
-			return err
-		}
-	}
-	return b.flush()
 }
 
 // displayPermission returns an escaped text cell; fixed labels need no escaping.

@@ -8,7 +8,6 @@ import (
 	"io"
 	"strings"
 	"testing"
-	"unicode/utf8"
 )
 
 func BenchmarkTextOutput(b *testing.B) {
@@ -72,53 +71,36 @@ func BenchmarkJSONOutput(b *testing.B) {
 func BenchmarkDisplayText(b *testing.B) {
 	for _, tc := range []struct {
 		name, input string
-		limit       int
 	}{
-		{"plain", "documents and archives", -1},
-		{"unicode", "共有ドキュメント", -1},
-		{"controls", strings.Repeat("\x00\x1b\u202e\U000e0001", 64), -1},
-		{"mixed", strings.Repeat("documents ", 25) + "\x00" + strings.Repeat("資料", 25), -1},
-		{"diagnostic", strings.Repeat("server rejected operation: ", 40), 500},
+		{"plain", "documents and archives"},
+		{"unicode", "共有ドキュメント"},
+		{"controls", strings.Repeat("\x00\x1b\u202e\U000e0001", 64)},
+		{"mixed", strings.Repeat("documents ", 25) + "\x00" + strings.Repeat("資料", 25)},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				displayText(tc.input, tc.limit)
+				displayText(tc.input)
 			}
 		})
 	}
 }
 
-func TestDisplayTextEscapingAndTruncation(t *testing.T) {
+func TestDisplayTextEscaping(t *testing.T) {
 	for _, tc := range []struct {
-		input string
-		limit int
-		want  string
+		input, want string
 	}{
-		{"\n\r\t\x00\x1b\x7f\u0080\u00ad\u200b\u202e\u2028\u2029\ufeff\U000e0001", -1, `\n\r\t\x00\x1b\x7f\x80\xad\u200b\u202e\u2028\u2029\ufeff\U000e0001`},
-		{"a\nb", 3, "a…"},
-		{"a\nb", 2, "a…"},
-		{"a\n", 3, `a\n`},
-		{"αβγ", 2, "α…"},
-		{"a\x00", 4, "a…"},
-		{"a\x00", 5, `a\x00`},
-		{"\u202e", 6, `\u202e`},
-		{"\U000e0001", 9, "…"},
-		{"\U000e0001", 10, `\U000e0001`},
-		{"", 0, ""},
-		{"x", 0, ""},
-		{"\x00", 0, ""},
-		{"x", 1, "x"},
-		{"xy", 1, "…"},
-		{"\xffx", -1, "�x"},
-		{"\xffx", 1, "…"},
+		{"\n\r\t\x00\x1b\x7f\u0080\u00ad\u200b\u202e\u2028\u2029\ufeff\U000e0001", `\n\r\t\x00\x1b\x7f\x80\xad\u200b\u202e\u2028\u2029\ufeff\U000e0001`},
+		{"a\nb", `a\nb`},
+		{"αβγ", "αβγ"},
+		{"a\x00", `a\x00`},
+		{"", ""},
+		{"xy", "xy"},
+		{"\xffx", "�x"},
 	} {
-		got := displayText(tc.input, tc.limit)
+		got := displayText(tc.input)
 		if got != tc.want {
-			t.Errorf("displayText(%q, %d) = %q; want %q", tc.input, tc.limit, got, tc.want)
-		}
-		if tc.limit >= 0 && utf8.RuneCountInString(got) > tc.limit {
-			t.Errorf("displayText(%q, %d) exceeded its limit: %q", tc.input, tc.limit, got)
+			t.Errorf("displayText(%q) = %q; want %q", tc.input, got, tc.want)
 		}
 	}
 }
@@ -144,8 +126,8 @@ func parseTestTSV(t *testing.T, output string) [][]string {
 	var rows [][]string
 	for _, line := range strings.Split(strings.TrimSuffix(output, "\n"), "\n") {
 		cells := strings.Split(line, "\t")
-		if len(cells) != 6 {
-			t.Fatalf("expected exactly six tab-separated cells, without banners or blank lines: %q", line)
+		if len(cells) != 7 {
+			t.Fatalf("expected exactly seven tab-separated cells, without banners or blank lines: %q", line)
 		}
 		rows = append(rows, cells)
 	}
@@ -165,48 +147,42 @@ func TestTSVPreservesFullEscapedCells(t *testing.T) {
 	for _, c := range cases {
 		result.Shares = append(result.Shares, ShareResult{Name: c.name, Accessible: Allowed, Read: Allowed, Write: Denied, Comment: "do not put comments in TSV", WriteBasis: "metadata details"})
 	}
-	var out, diagnostics bytes.Buffer
+	var out bytes.Buffer
 	if err := writeTextResult(&out, result); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeTextDiagnostics(&diagnostics, result); err != nil {
-		t.Fatal(err)
-	}
 	rows := parseTestTSV(t, out.String())
-	if len(rows) != len(cases) || diagnostics.Len() != 0 {
-		t.Fatalf("successful output has extra records or diagnostics: %q %q", out.String(), diagnostics.String())
+	if len(rows) != len(cases) {
+		t.Fatalf("successful output has extra records: %q", out.String())
 	}
 	for i, row := range rows {
-		if row[0] != "192.0.2.25:445" || row[1] != cases[i].escaped || strings.Join(row[2:], "|") != "TRUE|FALSE|FALSE|fileserver" {
+		if row[0] != "192.0.2.25:445" || row[1] != cases[i].escaped || strings.Join(row[2:], "|") != "TRUE|FALSE|FALSE|OK|fileserver" {
 			t.Errorf("row %d lost data or cell boundaries: %#v", i, row)
 		}
 	}
 }
 
-func TestOutputEscapesControlsInCellsAndDiagnostics(t *testing.T) {
+func TestOutputEscapesControlsInCells(t *testing.T) {
 	bad := "value\x1b[2J\t\n\u202e" + `\n`
 	result := Result{Target: bad, ServerIP: bad, Reachable: true, Authentication: bad, Enumeration: bad, Error: bad, Shares: []ShareResult{{Name: bad, Accessible: bad, Read: bad, Write: bad, Error: bad}}}
-	var out, diagnostics bytes.Buffer
+	var out bytes.Buffer
 	if err := writeTextResult(&out, result); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeTextDiagnostics(&diagnostics, result); err != nil {
 		t.Fatal(err)
 	}
 	rows := parseTestTSV(t, out.String())
 	if len(rows) != 1 {
 		t.Fatalf("untrusted cells changed row boundaries: %#v", rows)
 	}
-	for _, column := range []int{0, 1, 2, 3, 5} {
+	for _, column := range []int{0, 1, 2, 3, 6} {
 		if rows[0][column] != `value\x1b[2J\t\n\u202e\\n` {
 			t.Errorf("column %d controls and literal backslashes were not escaped exactly once: %q", column, rows[0][column])
 		}
 	}
-	if strings.ContainsAny(out.String()+diagnostics.String(), "\x1b\r\u202e") || strings.ContainsRune(diagnostics.String(), '\t') {
-		t.Fatalf("terminal controls escaped into output: %q %q", out.String(), diagnostics.String())
+	if strings.ContainsAny(out.String(), "\x1b\r\u202e") {
+		t.Fatalf("terminal controls escaped into output: %q", out.String())
 	}
-	if !strings.Contains(diagnostics.String(), `value\x1b[2J\t\n\u202e`) {
-		t.Fatalf("error details missing from stderr diagnostics: %q", diagnostics.String())
+	if rows[0][5] != "SMB_FAILED" {
+		t.Fatalf("untrusted diagnostic text replaced the compact status: %q", rows[0][5])
 	}
 }
 
@@ -403,7 +379,6 @@ func TestOutputRejectsShortWrites(t *testing.T) {
 		{"TSV result", func(out io.Writer) error { return writeTextResult(out, result) }},
 		{"aligned result", func(out io.Writer) error { return writeAlignedResult(out, result, false) }},
 		{"colored result", func(out io.Writer) error { return writeAlignedResult(out, result, true) }},
-		{"diagnostics", func(out io.Writer) error { return writeTextDiagnostics(out, result) }},
 		{"JSON", func(out io.Writer) error { return writeJSONResults(out, []Result{result}) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -446,48 +421,9 @@ func TestTSVBatchesCompleteRowsWithoutTruncation(t *testing.T) {
 		t.Fatalf("lost or duplicated rows: got %d, want %d", len(rows), len(result.Shares))
 	}
 	for i, row := range rows {
-		if row[1] != tsvCell(result.Shares[i].Name) || strings.Join(row[2:], "|") != "TRUE|FALSE|FALSE|server" {
+		if row[1] != tsvCell(result.Shares[i].Name) || strings.Join(row[2:], "|") != "TRUE|FALSE|FALSE|OK|server" {
 			t.Fatalf("row %d lost its name, order, or permission cells", i)
 		}
-	}
-}
-
-func TestDiagnosticsBatchesCompleteLines(t *testing.T) {
-	result := Result{Target: "server\n:445", Error: "host\rerror", Shares: make([]ShareResult, 2000)}
-	var expected bytes.Buffer
-	expected.WriteString("gosmb: server\\n:445: host\\rerror\n")
-	for i := range result.Shares {
-		result.Shares[i].Name = fmt.Sprintf("share-%04d\t", i)
-		if i%7 != 0 {
-			result.Shares[i].Error = "query failed\x1b[2J\n"
-			fmt.Fprintf(&expected, "gosmb: server\\n:445: share-%04d\\t: query failed\\x1b[2J\\n\n", i)
-		}
-	}
-	var combined bytes.Buffer
-	writes := 0
-	out := outputWriteFunc(func(data []byte) (int, error) {
-		writes++
-		if len(data) > (16<<10)+512 {
-			t.Fatalf("diagnostics accumulated beyond one batch plus its final line: %d bytes", len(data))
-		}
-		if !bytes.HasSuffix(data, []byte{'\n'}) {
-			t.Fatal("diagnostic batch ended in an incomplete line")
-		}
-		for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
-			if !strings.HasPrefix(line, "gosmb: ") {
-				t.Fatalf("diagnostic batch contains an incomplete or unescaped line: %q", line)
-			}
-		}
-		return combined.Write(data)
-	})
-	if err := writeTextDiagnostics(out, result); err != nil {
-		t.Fatal(err)
-	}
-	if writes < 2 {
-		t.Fatal("large host's diagnostics were retained in one output buffer")
-	}
-	if !bytes.Equal(combined.Bytes(), expected.Bytes()) {
-		t.Fatal("batched diagnostics lost their contents, escaping, or order")
 	}
 }
 
@@ -497,7 +433,6 @@ func TestTextOutputStopsAfterFailedBatch(t *testing.T) {
 		write func(io.Writer, Result) error
 	}{
 		{"TSV", writeTextResult},
-		{"diagnostics", writeTextDiagnostics},
 		{"aligned", func(out io.Writer, result Result) error { return writeAlignedResult(out, result, false) }},
 		{"colored", func(out io.Writer, result Result) error { return writeAlignedResult(out, result, true) }},
 	} {
@@ -552,7 +487,7 @@ func TestTSVRepeatsEndpointAndGuestFallbackForEveryShare(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := parseTestTSV(t, out.String())
-	if len(rows) != 3 || strings.Join(rows[0], "|") != "192.0.2.25:445|public|TRUE|FALSE|TRUE|fileserver" || strings.Join(rows[1], "|") != "192.0.2.25:445|private|FALSE|UNKNOWN|TRUE|fileserver" || strings.Join(rows[2], "|") != "192.0.2.25:445|IPC$|N/A|N/A|TRUE|fileserver" {
+	if len(rows) != 3 || strings.Join(rows[0], "|") != "192.0.2.25:445|public|TRUE|FALSE|TRUE|OK|fileserver" || strings.Join(rows[1], "|") != "192.0.2.25:445|private|FALSE|UNKNOWN|TRUE|OK|fileserver" || strings.Join(rows[2], "|") != "192.0.2.25:445|IPC$|N/A|N/A|TRUE|OK|fileserver" {
 		t.Fatalf("TSV lost per-share permissions/fallback: %q", out.String())
 	}
 	r.GuestFallback = false
@@ -569,17 +504,18 @@ func TestTSVRepeatsEndpointAndGuestFallbackForEveryShare(t *testing.T) {
 }
 
 func TestTSVKeepsFailedAndEmptyServersVisible(t *testing.T) {
-	for _, r := range []Result{
-		{Target: "offline:445", Authentication: "not_attempted", Enumeration: "not_attempted", Error: "connection timed out"},
-		{Target: "192.0.2.30:445", ServerIP: "192.0.2.30", Reachable: true, Authentication: "failed", Enumeration: "not_attempted", Error: "login failed"},
-		{Target: "192.0.2.31:445", ServerIP: "192.0.2.31", Reachable: true, Authentication: "guest", GuestFallback: true, Enumeration: "denied", Error: "enumeration denied"},
-		{Target: "192.0.2.32:445", ServerIP: "192.0.2.32", Reachable: true, Authentication: "authenticated", Enumeration: "ok"},
+	for _, tc := range []struct {
+		result Result
+		status string
+	}{
+		{Result{Target: "offline:445", Authentication: "not_attempted", Enumeration: "not_attempted", Error: "connection timed out"}, "CONNECT_FAILED"},
+		{Result{Target: "192.0.2.30:445", ServerIP: "192.0.2.30", Reachable: true, Authentication: "failed", Enumeration: "not_attempted", Error: "login failed"}, "AUTH_FAILED"},
+		{Result{Target: "192.0.2.31:445", ServerIP: "192.0.2.31", Reachable: true, Authentication: "guest", GuestFallback: true, Enumeration: "denied", Error: "enumeration denied"}, "ENUM_DENIED"},
+		{Result{Target: "192.0.2.32:445", ServerIP: "192.0.2.32", Reachable: true, Authentication: "authenticated", Enumeration: "ok"}, "NO_SHARES"},
 	} {
-		var out, diagnostics bytes.Buffer
+		r := tc.result
+		var out bytes.Buffer
 		if err := writeTextResult(&out, r); err != nil {
-			t.Fatal(err)
-		}
-		if err := writeTextDiagnostics(&diagnostics, r); err != nil {
 			t.Fatal(err)
 		}
 		endpoint, hostname := r.Target, "-"
@@ -590,16 +526,67 @@ func TestTSVKeepsFailedAndEmptyServersVisible(t *testing.T) {
 		if r.GuestFallback {
 			fallback = "TRUE"
 		}
-		want := endpoint + "|-|UNKNOWN|UNKNOWN|" + fallback + "|" + hostname
+		want := endpoint + "|-|UNKNOWN|UNKNOWN|" + fallback + "|" + tc.status + "|" + hostname
 		rows := parseTestTSV(t, out.String())
 		if len(rows) != 1 || strings.Join(rows[0], "|") != want {
 			t.Fatalf("server status disappeared from TSV: %q", out.String())
 		}
-		if r.Error != "" && strings.Count(diagnostics.String(), r.Error) != 1 {
-			t.Fatalf("failure must be reported once on stderr: %q", diagnostics.String())
-		}
-		if r.Enumeration == "ok" && !strings.Contains(strings.ToLower(diagnostics.String()), "no shares returned") {
-			t.Fatalf("missing empty-server diagnostic: %q", diagnostics.String())
+	}
+}
+
+func TestTextFormatsShareStatusAndColumnOrder(t *testing.T) {
+	result := Result{Target: "fileserver:445", ServerIP: "192.0.2.25", Reachable: true,
+		Authentication: "authenticated", Enumeration: "ok", status: statusOK,
+		Shares: []ShareResult{
+			{Name: "good", Read: Allowed, Write: Denied, status: statusOK},
+			{Name: "failed", Read: Allowed, Write: Unknown, Error: "private failure details", status: statusCheckFailed},
+			{Name: "timedout", Read: Allowed, Write: TimedOut, Error: "private timeout details", status: statusCheckTimeout},
+		}}
+	for _, tc := range []struct {
+		name             string
+		host, completion scanStatus
+		want             [3]string
+	}{
+		{"share results", statusOK, statusUnset, [3]string{"OK", "CHECK_FAILED", "CHECK_TIMEOUT"}},
+		{"primary host failure", statusEnumPartial, statusUnset, [3]string{"ENUM_PARTIAL", "ENUM_PARTIAL", "ENUM_PARTIAL"}},
+		{"host cleanup", statusOK, statusCleanupFailed, [3]string{"CLEANUP_FAILED", "CHECK_FAILED", "CHECK_TIMEOUT"}},
+	} {
+		for _, aligned := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/aligned=%t", tc.name, aligned), func(t *testing.T) {
+				result.status, result.completionStatus = tc.host, tc.completion
+				var out bytes.Buffer
+				var rows [][]string
+				if aligned {
+					if err := writeAlignedHeader(&out); err != nil {
+						t.Fatal(err)
+					}
+					if err := writeAlignedResult(&out, result, false); err != nil {
+						t.Fatal(err)
+					}
+					for _, line := range strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n") {
+						rows = append(rows, strings.Fields(line))
+					}
+				} else {
+					if err := writeTextHeader(&out); err != nil {
+						t.Fatal(err)
+					}
+					if err := writeTextResult(&out, result); err != nil {
+						t.Fatal(err)
+					}
+					rows = parseTestTSV(t, out.String())
+				}
+				if len(rows) != 4 || strings.Join(rows[0], "|") != "TARGET_IP|SHARE|READ|WRITE|GUEST|STATUS|HOSTNAME" {
+					t.Fatalf("text output changed column order or record count: %q", out.String())
+				}
+				for i, row := range rows[1:] {
+					if len(row) != 7 || row[1] != result.Shares[i].Name || row[5] != tc.want[i] || row[6] != "fileserver" {
+						t.Fatalf("row %d lost status, ordering, or final hostname: %q", i, row)
+					}
+				}
+				if strings.Contains(out.String(), "private") {
+					t.Fatalf("diagnostic detail appeared outside compact STATUS: %q", out.String())
+				}
+			})
 		}
 	}
 }
@@ -665,16 +652,16 @@ func TestTimeoutOutputPreservesKnownPermissionsAndAuthentication(t *testing.T) {
 		result Result
 		want   string
 	}{
-		{"before authentication", Result{TimedOut: true, Authentication: TimedOut, Enumeration: TimedOut}, "UNKNOWN|-|TIMEOUT|TIMEOUT|TIMEOUT|-"},
-		{"explicit guest before authentication", Result{TimedOut: true, Authentication: TimedOut, Enumeration: TimedOut, explicitGuest: true}, "UNKNOWN|-|TIMEOUT|TIMEOUT|N/A|-"},
-		{"authenticated", Result{Target: "192.0.2.1:445", ServerIP: "192.0.2.1", TimedOut: true, Authentication: "authenticated", Enumeration: TimedOut}, "192.0.2.1:445|-|TIMEOUT|TIMEOUT|FALSE|-"},
-		{"guest fallback", Result{Target: "192.0.2.1:445", ServerIP: "192.0.2.1", TimedOut: true, Authentication: "guest", GuestFallback: true, Enumeration: TimedOut}, "192.0.2.1:445|-|TIMEOUT|TIMEOUT|TRUE|-"},
-		{"empty list before cleanup timeout", Result{Target: "192.0.2.1:445", TimedOut: true, Authentication: "authenticated", Enumeration: "ok", enumerationComplete: true}, "192.0.2.1:445|-|UNKNOWN|UNKNOWN|FALSE|-"},
-		{"denial before cleanup timeout", Result{Target: "192.0.2.1:445", TimedOut: true, Authentication: "guest", GuestFallback: true, Enumeration: "denied", enumerationComplete: true}, "192.0.2.1:445|-|UNKNOWN|UNKNOWN|TRUE|-"},
-		{"completed failure before cleanup timeout", Result{Target: "192.0.2.1:445", TimedOut: true, Authentication: "authenticated", Enumeration: "error", enumerationComplete: true}, "192.0.2.1:445|-|UNKNOWN|UNKNOWN|FALSE|-"},
-		{"empty list from scan hook", Result{Target: "192.0.2.1:445", TimedOut: true, Authentication: "authenticated", Enumeration: "ok"}, "192.0.2.1:445|-|UNKNOWN|UNKNOWN|FALSE|-"},
-		{"denial from scan hook", Result{Target: "192.0.2.1:445", TimedOut: true, Authentication: "guest", Enumeration: "denied"}, "192.0.2.1:445|-|UNKNOWN|UNKNOWN|FALSE|-"},
-		{"partially checked share", Result{Target: "192.0.2.1:445", ServerIP: "192.0.2.1", TimedOut: true, Authentication: "authenticated", Enumeration: "ok", Shares: []ShareResult{{Name: "files", Read: Allowed, Write: TimedOut}}}, "192.0.2.1:445|files|TRUE|TIMEOUT|FALSE|-"},
+		{"before authentication", Result{TimedOut: true, Authentication: TimedOut, Enumeration: TimedOut}, "UNKNOWN|-|TIMEOUT|TIMEOUT|TIMEOUT|CONNECT_TIMEOUT|-"},
+		{"explicit guest before authentication", Result{TimedOut: true, Authentication: TimedOut, Enumeration: TimedOut, explicitGuest: true}, "UNKNOWN|-|TIMEOUT|TIMEOUT|N/A|CONNECT_TIMEOUT|-"},
+		{"authenticated", Result{Target: "192.0.2.1:445", ServerIP: "192.0.2.1", TimedOut: true, Authentication: "authenticated", Enumeration: TimedOut}, "192.0.2.1:445|-|TIMEOUT|TIMEOUT|FALSE|ENUM_TIMEOUT|-"},
+		{"guest fallback", Result{Target: "192.0.2.1:445", ServerIP: "192.0.2.1", TimedOut: true, Authentication: "guest", GuestFallback: true, Enumeration: TimedOut}, "192.0.2.1:445|-|TIMEOUT|TIMEOUT|TRUE|ENUM_TIMEOUT|-"},
+		{"empty list before cleanup timeout", Result{Target: "192.0.2.1:445", TimedOut: true, Authentication: "authenticated", Enumeration: "ok", enumerationComplete: true, completionStatus: statusCleanupTimeout}, "192.0.2.1:445|-|UNKNOWN|UNKNOWN|FALSE|CLEANUP_TIMEOUT|-"},
+		{"denial before cleanup timeout", Result{Target: "192.0.2.1:445", TimedOut: true, Authentication: "guest", GuestFallback: true, Enumeration: "denied", enumerationComplete: true, completionStatus: statusCleanupTimeout}, "192.0.2.1:445|-|UNKNOWN|UNKNOWN|TRUE|ENUM_DENIED|-"},
+		{"completed failure before cleanup timeout", Result{Target: "192.0.2.1:445", TimedOut: true, Authentication: "authenticated", Enumeration: "error", enumerationComplete: true}, "192.0.2.1:445|-|UNKNOWN|UNKNOWN|FALSE|ENUM_FAILED|-"},
+		{"empty list from scan hook", Result{Target: "192.0.2.1:445", TimedOut: true, Authentication: "authenticated", Enumeration: "ok"}, "192.0.2.1:445|-|UNKNOWN|UNKNOWN|FALSE|NO_SHARES|-"},
+		{"denial from scan hook", Result{Target: "192.0.2.1:445", TimedOut: true, Authentication: "guest", Enumeration: "denied"}, "192.0.2.1:445|-|UNKNOWN|UNKNOWN|FALSE|ENUM_DENIED|-"},
+		{"partially checked share", Result{Target: "192.0.2.1:445", ServerIP: "192.0.2.1", TimedOut: true, Authentication: "authenticated", Enumeration: "ok", Shares: []ShareResult{{Name: "files", Read: Allowed, Write: TimedOut}}}, "192.0.2.1:445|files|TRUE|TIMEOUT|FALSE|CHECK_TIMEOUT|-"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var out bytes.Buffer

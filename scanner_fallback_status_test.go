@@ -89,9 +89,9 @@ func TestDeniedFallbackStatusDependsOnRequiredMetadata(t *testing.T) {
 							t.Errorf("JSON result or schema changed: %s", out.String())
 						}
 					} else {
-						wantRow := fixture.target.String() + "\tdata$\tFALSE\t" + share.wantText + "\tFALSE\t-\n"
-						if !strings.Contains(out.String(), wantRow) || !strings.Contains(errOut.String(), wantDisk.Error) {
-							t.Errorf("TSV permission row or diagnostic changed: stdout=%q stderr=%q", out.String(), errOut.String())
+						wantRow := fixture.target.String() + "\tdata$\tFALSE\t" + share.wantText + "\tFALSE\t" + share.wantStatus + "\t-\n"
+						if !strings.Contains(out.String(), wantRow) || errOut.Len() != 0 {
+							t.Errorf("TSV must report permissions and status without separate diagnostics: stdout=%q stderr=%q", out.String(), errOut.String())
 						}
 					}
 				}

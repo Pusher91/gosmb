@@ -130,6 +130,9 @@ func TestAuthenticationDiagnosticsPreserveReportFormat(t *testing.T) {
 				}
 				deps.scan = func(context.Context, Target, Options) Result { return scanResult }
 				args := []string{fixture.target.String(), "-u", fixture.options.Username, "-p", fixture.options.Password}
+				if format.name == "TSV" {
+					args = append(args, "--tsv")
+				}
 				if format.json {
 					args = append(args, "--json")
 				}
@@ -166,25 +169,18 @@ func TestAuthenticationDiagnosticsPreserveReportFormat(t *testing.T) {
 				t.Errorf("diagnostic changed stdout: %q; legacy %q", out, legacyOut)
 			}
 			lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
-			columns := 6
-			if format.terminal {
-				columns = 7
-			}
+			const columns = 7
 			if len(lines) != 2 || len(strings.Fields(lines[0])) != columns || len(strings.Fields(lines[1])) != columns {
 				t.Fatalf("expected one %d-column header and row: %q", columns, out)
 			}
-			if format.terminal && (strings.Fields(lines[0])[5] != "STATUS" || strings.Fields(lines[1])[5] != "AUTH_FAILED") {
-				t.Errorf("authentication failure missing from interactive status: %q", out)
+			if strings.Fields(lines[0])[5] != "STATUS" || strings.Fields(lines[1])[5] != "AUTH_FAILED" {
+				t.Errorf("authentication failure missing from status: %q", out)
 			}
 			if format.color && !strings.Contains(out, "\x1b[31mFALSE\x1b[0m") {
 				t.Errorf("diagnostic changed the colored status cell: %q", out)
 			}
-			wantDiagnostics := "gosmb: " + result.Target + ": " + diagnostic + "\n"
-			if format.terminal {
-				wantDiagnostics = ""
-			}
-			if diagnostics != wantDiagnostics {
-				t.Errorf("stderr = %q; want %q", diagnostics, wantDiagnostics)
+			if diagnostics != "" {
+				t.Errorf("unexpected separate scan diagnostic: %q", diagnostics)
 			}
 			if strings.Contains(out+diagnostics, fixture.options.Password) {
 				t.Error("diagnostic exposed the supplied password")

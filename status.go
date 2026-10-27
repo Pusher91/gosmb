@@ -46,33 +46,40 @@ const (
 	statusCount
 )
 
-// tableStatus never interprets free-form Error text. Recorded host failures
+func tableStatus(result Result, share *ShareResult) string {
+	return statusLabels[resultStatus(result, share)]
+}
+
+// resultStatus never interprets free-form Error text. Recorded host failures
 // affect every row; a failed share check affects only that share. In particular,
 // access denied is an observed permission, not a failed check.
-func tableStatus(result Result, share *ShareResult) string {
+func resultStatus(result Result, share *ShareResult) scanStatus {
 	status := result.status
 	if status == statusUnset {
 		status = inferredHostStatus(result)
 	}
 	if status != statusOK {
-		return statusLabels[status]
+		return status
 	}
 	if share != nil {
-		status = share.status
-		if status == statusUnset {
-			status = inferredShareStatus(*share)
-		}
-		if status != statusOK {
-			return statusLabels[status]
+		if status := shareStatus(*share); status != statusOK {
+			return status
 		}
 	}
 	if result.completionStatus != statusUnset {
-		return statusLabels[result.completionStatus]
+		return result.completionStatus
 	}
 	if share == nil && result.Enumeration == "ok" && len(result.Shares) == 0 {
-		return statusLabels[statusNoShares]
+		return statusNoShares
 	}
-	return statusLabels[statusOK]
+	return statusOK
+}
+
+func shareStatus(share ShareResult) scanStatus {
+	if share.status != statusUnset {
+		return share.status
+	}
+	return inferredShareStatus(share)
 }
 
 // These fallbacks also support scan hooks and results read without private
@@ -168,7 +175,7 @@ func operationStatus(err, transportErr error, failed, timeout scanStatus) scanSt
 }
 
 // Authentication classification and its diagnostic text share one mapping so
-// JSON, TSV diagnostics, and the interactive table cannot disagree. Only a
+// JSON error details and text status codes cannot disagree. Only a
 // session-setup rejection describes an authentication failure.
 func authenticationFailure(err error) (scanStatus, string) {
 	status, ok := errors.AsType[*smb.NTStatusError](err)

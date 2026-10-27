@@ -197,7 +197,7 @@ func TestCLIMappedIPv4AliasesStartOnlyOneScan(t *testing.T) {
 		}
 		return Result{Target: target.String(), ServerIP: target.Host, Authentication: "guest", Enumeration: "ok"}
 	}
-	code := runCLI(context.Background(), []string{path, "--guest", "--no-header", "--delay=0"}, deps)
+	code := runCLI(context.Background(), []string{path, "--guest", "--no-header", "--delay=0", "--tsv"}, deps)
 	if code != 0 || calls != 1 {
 		t.Fatalf("equivalent literal endpoints were scanned more than once: exit=%d scans=%d", code, calls)
 	}
@@ -215,7 +215,7 @@ func TestCLICIDRScansEachExpandedTargetAndReportsProgress(t *testing.T) {
 		t.Run(input, func(t *testing.T) {
 			var out, errOut bytes.Buffer
 			deps := testCLIDeps(&out, &errOut)
-			deps.stderrIsTerminal = true
+			deps.stdoutIsTerminal, deps.stderrIsTerminal = true, true
 			var attempted []Target
 			deps.scan = func(_ context.Context, target Target, _ Options) Result {
 				attempted = append(attempted, target)
@@ -223,7 +223,7 @@ func TestCLICIDRScansEachExpandedTargetAndReportsProgress(t *testing.T) {
 					Authentication: "guest", Enumeration: "ok",
 					Shares: []ShareResult{{Name: "data", Read: Allowed, Write: Denied}}}
 			}
-			code := runCLI(context.Background(), []string{input, "--guest", "--delay=0"}, deps)
+			code := runCLI(context.Background(), []string{input, "--guest", "--delay=0", "--tsv"}, deps)
 			want := []Target{{"192.0.2.0", 1445}, {"192.0.2.1", 1445}, {"192.0.2.2", 1445}, {"192.0.2.3", 1445}}
 			if code != 0 || !reflect.DeepEqual(attempted, want) {
 				t.Fatalf("code=%d attempted=%#v; want %#v", code, attempted, want)
@@ -233,7 +233,7 @@ func TestCLICIDRScansEachExpandedTargetAndReportsProgress(t *testing.T) {
 				t.Fatalf("unexpected expanded result row count: %#v", rows)
 			}
 			for i, target := range want {
-				if rows[i+1][0] != target.String() || rows[i+1][5] != "-" {
+				if rows[i+1][0] != target.String() || rows[i+1][6] != "-" {
 					t.Errorf("expanded result lost its literal endpoint: %#v", rows[i+1])
 				}
 			}
