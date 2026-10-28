@@ -85,7 +85,8 @@ func TestHelpTokensRemainOptionValues(t *testing.T) {
 		{[]string{"host", "--user=-h", "--password=--help"}, "-h", "--help", ""},
 		{[]string{"host", "--username", "--help", "--pass", "-h"}, "--help", "-h", ""},
 		{[]string{"host", "--username=-h", "--pass=--help"}, "-h", "--help", ""},
-		{[]string{"host", "-u", "alice", "-d", "-h", "-p", ""}, "alice", "", "-h"},
+		{[]string{"host", "-u", `-h\alice`, "-p", ""}, "alice", "", "-h"},
+		{[]string{"host", "-u", "alice@--help", "-p", ""}, "alice", "", "--help"},
 	} {
 		cfg, err := parseCLI(context.Background(), tt.args)
 		if err != nil || cfg.help || cfg.options.Username != tt.user || cfg.options.Password != tt.password || cfg.options.Domain != tt.domain {

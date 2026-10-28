@@ -628,6 +628,7 @@ func TestStatusColorsPreserveAlignmentAndEscapeServerText(t *testing.T) {
 		{Name: "TRUE", Read: Allowed, Write: Denied},
 		{Name: "FALSE", Read: Unknown, Write: TimedOut},
 		{Name: "untrusted\x1b[31m", Read: NotApplicable, Write: NotApplicable},
+		{Name: "AUTH_FAILED", Read: NotApplicable, Write: NotApplicable},
 	}}
 	var plain, colored bytes.Buffer
 	if err := writeAlignedResult(&plain, result, false); err != nil {
@@ -637,12 +638,43 @@ func TestStatusColorsPreserveAlignmentAndEscapeServerText(t *testing.T) {
 		t.Fatal(err)
 	}
 	output := colored.String()
-	if strings.Count(output, "\x1b[32mTRUE\x1b[0m") != 4 || strings.Count(output, "\x1b[31mFALSE\x1b[0m") != 1 {
+	if strings.Count(output, "\x1b[32mTRUE\x1b[0m") != 5 || strings.Count(output, "\x1b[31mFALSE\x1b[0m") != 1 ||
+		strings.Contains(output, "\x1b[31mAUTH_FAILED\x1b[0m") {
 		t.Fatalf("colors were missing or applied outside status columns: %q", output)
 	}
-	stripped := strings.NewReplacer("\x1b[32m", "", "\x1b[31m", "", "\x1b[0m", "").Replace(output)
+	if !strings.Contains(output, "\x1b[33mUNKNOWN\x1b[0m") || !strings.Contains(output, "\x1b[33mTIMEOUT\x1b[0m") ||
+		!strings.Contains(output, "\x1b[33mCHECK_TIMEOUT\x1b[0m") || strings.Count(output, "\x1b[32mOK\x1b[0m") != 3 {
+		t.Fatalf("check outcomes or unknown/timeout permissions were not colored: %q", output)
+	}
+	stripped := strings.NewReplacer("\x1b[32m", "", "\x1b[31m", "", "\x1b[33m", "", "\x1b[0m", "").Replace(output)
 	if stripped != plain.String() || !strings.Contains(stripped, `untrusted\x1b[31m`) {
 		t.Fatalf("colors changed visible columns or server-text escaping: %q", output)
+	}
+}
+
+func TestGuestFailureRowsAreColoredWithoutPermissionBooleans(t *testing.T) {
+	for _, tc := range []struct {
+		name, permission, status, color string
+		result                          Result
+	}{
+		{"authentication failure", "UNKNOWN", "AUTH_FAILED", "\x1b[31m", Result{Authentication: "failed", Reachable: true}},
+		{"connection timeout", "TIMEOUT", "CONNECT_TIMEOUT", "\x1b[33m", Result{Authentication: TimedOut, TimedOut: true}},
+		{"protocol failure", "UNKNOWN", "SMB_FAILED", "\x1b[31m", Result{Authentication: "error", Reachable: true}},
+		{"canceled", "UNKNOWN", "CANCELED", "\x1b[33m", Result{status: statusCanceled}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := tc.result
+			result.Target, result.ServerIP, result.explicitGuest = "AUTH_FAILED:445", "192.0.2.1", true
+			var out bytes.Buffer
+			if err := writeAlignedResult(&out, result, true); err != nil {
+				t.Fatal(err)
+			}
+			permission := "\x1b[33m" + tc.permission + "\x1b[0m"
+			want := []string{"192.0.2.1:445", "-", permission, permission, "N/A", tc.color + tc.status + "\x1b[0m", "AUTH_FAILED"}
+			if got := strings.Fields(out.String()); strings.Join(got, "|") != strings.Join(want, "|") {
+				t.Fatalf("failure colors changed guest semantics or identity columns: %q; want %q", got, want)
+			}
+		})
 	}
 }
 

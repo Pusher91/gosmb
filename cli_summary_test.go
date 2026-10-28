@@ -9,7 +9,23 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
+	"time"
 )
+
+// Other summary tests check exact counts without depending on wall-clock speed.
+// Timing values and the interval measured by the CLI have dedicated tests.
+func cliSummaryWithoutTiming(t *testing.T, output string) string {
+	t.Helper()
+	before, timing, ok := strings.Cut(output, "; elapsed ")
+	if !ok {
+		t.Fatalf("summary omitted elapsed time: %q", output)
+	}
+	_, after, ok := strings.Cut(timing, " hosts/s\n")
+	if !ok {
+		t.Fatalf("summary omitted completed hosts/s: %q", output)
+	}
+	return before + "\n" + after
+}
 
 func TestCLISummaryFollowsProgressAndHonorsOutputModes(t *testing.T) {
 	path := schedulerHostFile(t, "first", "second")
@@ -60,7 +76,7 @@ func TestCLISummaryFollowsProgressAndHonorsOutputModes(t *testing.T) {
 				if diagnostics.Len() != 0 {
 					t.Fatalf("disabled progress emitted summary or diagnostics: %q", diagnostics.String())
 				}
-			} else if !strings.HasSuffix(diagnostics.String(), summary) ||
+			} else if !strings.HasSuffix(cliSummaryWithoutTiming(t, diagnostics.String()), summary) ||
 				strings.Count(diagnostics.String(), "Summary:") != 1 ||
 				strings.LastIndex(diagnostics.String(), "Progress:") >= strings.Index(diagnostics.String(), "Summary:") {
 				t.Fatalf("summary did not follow final progress exactly once: %q", diagnostics.String())
@@ -99,12 +115,12 @@ func TestCLISummaryRetainsInterruptionRecordAndCountsQueuedHosts(t *testing.T) {
 		return schedulerSuccess(target)
 	}
 	path := schedulerHostFile(t, "first", "second", "queued")
-	if code := runCLI(ctx, []string{path, "-u", "fixture", "-p", ""}, deps); code != 1 || calls != 2 {
+	if code := runCLI(ctx, []string{path, "-u", "fixture", "-p", "", "--concurrency=1"}, deps); code != 1 || calls != 2 {
 		t.Fatalf("interruption changed scheduling: code=%d scans=%d", code, calls)
 	}
 	const summary = "Summary: 1/3 hosts completed; 1 interrupted; 1 not started\n" +
 		"Host outcomes: OK=1 CANCELED=1\nShares: 2 found; 2 readable; 0 writable (metadata)\n"
-	if !strings.HasSuffix(diagnostics.String(), summary) || strings.Contains(diagnostics.String(), "(interrupted)") {
+	if !strings.HasSuffix(cliSummaryWithoutTiming(t, diagnostics.String()), summary) || strings.Contains(diagnostics.String(), "(interrupted)") {
 		t.Fatalf("interrupted run lost aggregate summary or duplicated its progress record: %q", diagnostics.String())
 	}
 	if !strings.HasSuffix(out.String(), "Progress: 33% (1/3 hosts completed) (interrupted)\n") ||
@@ -229,7 +245,7 @@ func TestCLISummaryDrainsActiveAttemptsAfterOutputFailure(t *testing.T) {
 				}
 				const summary = "Summary: 1/3 hosts completed; 1 interrupted; 1 not started\n" +
 					"Host outcomes: OK=1 CANCELED=1\nShares: 2 found; 2 readable; 0 writable (metadata)\n"
-				if !strings.HasSuffix(diagnostics.String(), summary) || strings.Contains(diagnostics.String(), "gosmb: canceled") {
+				if !strings.HasSuffix(cliSummaryWithoutTiming(t, diagnostics.String()), summary) || strings.Contains(diagnostics.String(), "gosmb: canceled") {
 					t.Fatalf("output failure miscounted active work or claimed user cancellation: %q", diagnostics.String())
 				}
 				if mode == "JSON progress" {
@@ -237,6 +253,52 @@ func TestCLISummaryDrainsActiveAttemptsAfterOutputFailure(t *testing.T) {
 					if err := json.Unmarshal(out.Bytes(), &results); err != nil || len(results) != 2 || results[1].Target != "second:445" {
 						t.Fatalf("progress failure discarded the active JSON result: %q, %v", out.String(), err)
 					}
+				}
+			})
+		})
+	}
+}
+
+func TestCLISummaryMeasuresScanAndStreamingTime(t *testing.T) {
+	for _, mode := range []struct {
+		name, flag, timing string
+	}{
+		{"table", "", "750ms; 1.3 hosts/s"},
+		{"JSON", "--json", "250ms; 4.0 hosts/s"},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var out, diagnostics bytes.Buffer
+				stdout := outputWriteFunc(func(data []byte) (int, error) {
+					if bytes.HasPrefix(data, []byte("TARGET_IP")) {
+						time.Sleep(time.Second)
+					}
+					if bytes.Contains(data, []byte("host-share")) {
+						time.Sleep(500 * time.Millisecond)
+					}
+					return out.Write(data)
+				})
+				deps := testCLIDeps(stdout, &diagnostics)
+				deps.stderrIsTerminal = true
+				deps.prompt = func(context.Context, io.Reader, io.Writer) (string, error) {
+					time.Sleep(2 * time.Second)
+					return "fixture", nil
+				}
+				deps.scan = func(_ context.Context, target Target, _ Options) Result {
+					time.Sleep(250 * time.Millisecond)
+					return schedulerSuccess(target)
+				}
+				args := []string{"host", "-u", "fixture"}
+				if mode.flag != "" {
+					args = append(args, mode.flag)
+				}
+				if code := runCLI(context.Background(), args, deps); code != 0 {
+					t.Fatalf("successful scan exit code=%d; stderr=%q", code, diagnostics.String())
+				}
+				want := "Summary: 1/1 hosts completed; 0 interrupted; 0 not started; elapsed " + mode.timing + "\n" +
+					"Host outcomes: OK=1\nShares: 1 found; 1 readable; 0 writable (metadata)\n"
+				if !strings.HasSuffix(diagnostics.String(), want) {
+					t.Fatalf("summary included setup/final JSON time or omitted streaming stalls: got %q; want suffix %q", diagnostics.String(), want)
 				}
 			})
 		})

@@ -27,14 +27,14 @@ Maximum: 65,536 unique endpoints per run; larger individual ranges are rejected.
 Options (before or after the target):
   -u, --user USER       Account; DOMAIN\user or user@domain
   -p, --password PASS   Password; otherwise GOSMB_PASSWORD or hidden prompt
-  -d, --domain DOMAIN   Account domain
-      --guest           Guest access; excludes -u, -p, -d
-      --concurrency N   Parallel hosts (default: 1)
+      --guest           Guest access; excludes -u, -p
+      --concurrency N   Parallel hosts (default: 40)
       --host-timeout N  Per-host limit in seconds (default: 30)
       --timeout TIME    SMB I/O timeout (default: 10s)
       --delay TIME      Minimum time between starting host scans (default: 0; no delay)
       --json            JSON output
       --tsv             Tab-separated output with full values
+      --shares-only     Show only hosts with discovered shares
       --no-header       Omit text header
       --no-progress     Hide progress and summary
   -h, --help            Show help
@@ -69,6 +69,7 @@ type cliConfig struct {
 	concurrency int
 	json        bool
 	tsv         bool
+	sharesOnly  bool
 	noHeader    bool
 	noProgress  bool
 	passwordSet bool
@@ -98,8 +99,6 @@ func canonicalCLIOption(name string) (canonical string, takesValue bool) {
 		return "--user", true
 	case "-p", "--pass", "--password":
 		return "--password", true
-	case "-d", "--domain":
-		return "--domain", true
 	case "--timeout", "--host-timeout", "--concurrency", "--delay":
 		return name, true
 	}
@@ -133,7 +132,7 @@ func helpRequested(args []string) bool {
 // credential must not be repeated in an error message.
 func parseCLI(ctx context.Context, args []string) (cliConfig, error) {
 	cfg := cliConfig{options: Options{Timeout: 10 * time.Second, HostTimeout: 30 * time.Second},
-		delay: 0, concurrency: 1, help: helpRequested(args)}
+		delay: 0, concurrency: 40, help: helpRequested(args)}
 	if cfg.help {
 		return cfg, nil
 	}
@@ -164,6 +163,8 @@ func parseCLI(ctx context.Context, args []string) (cliConfig, error) {
 			toggle = &cfg.json
 		case "--tsv":
 			toggle = &cfg.tsv
+		case "--shares-only":
+			toggle = &cfg.sharesOnly
 		case "--no-header":
 			toggle = &cfg.noHeader
 		case "--no-progress":
@@ -196,9 +197,6 @@ func parseCLI(ctx context.Context, args []string) (cliConfig, error) {
 		case "--password":
 			credentialsSet = true
 			cfg.options.Password, cfg.passwordSet = value, true
-		case "--domain":
-			credentialsSet = true
-			cfg.options.Domain = value
 		case "--timeout":
 			d, err := time.ParseDuration(value)
 			if err != nil || d <= 0 {
@@ -226,14 +224,14 @@ func parseCLI(ctx context.Context, args []string) (cliConfig, error) {
 		}
 	}
 	if cfg.options.Guest && credentialsSet {
-		return cfg, errors.New("--guest cannot be combined with username, password, or domain options")
+		return cfg, errors.New("--guest cannot be combined with username or password options")
 	}
 	if cfg.json && cfg.tsv {
 		return cfg, errors.New("choose either --json or --tsv")
 	}
 	var err error
 	if !cfg.options.Guest {
-		cfg.options.Username, cfg.options.Domain, err = parseIdentity(cfg.options.Username, cfg.options.Domain)
+		cfg.options.Username, cfg.options.Domain, err = parseIdentity(cfg.options.Username)
 		if err != nil {
 			return cfg, err
 		}
@@ -269,44 +267,35 @@ func parseCLI(ctx context.Context, args []string) (cliConfig, error) {
 	return cfg, err
 }
 
-func parseIdentity(user, domain string) (string, string, error) {
+func parseIdentity(user string) (string, string, error) {
 	if user == "" {
 		return "", "", errors.New("username required: use -u USER or --guest")
 	}
-	if !utf8.ValidString(user) || !utf8.ValidString(domain) {
+	if !utf8.ValidString(user) {
 		return "", "", errors.New("username and domain must be valid UTF-8")
 	}
-	if strings.TrimSpace(user) != user || strings.TrimSpace(domain) != domain {
+	if strings.TrimSpace(user) != user {
 		return "", "", errors.New("username and domain must not have surrounding whitespace")
 	}
-	if strings.ContainsFunc(user+domain, unicode.IsControl) {
+	if strings.ContainsFunc(user, unicode.IsControl) {
 		return "", "", errors.New("username and domain must not contain control characters")
 	}
-	var embeddedDomain string
-	qualified := strings.ContainsAny(user, `\@`)
+	var domain string
 	if strings.Contains(user, `\`) {
 		if strings.Count(user, `\`) != 1 || strings.Contains(user, "@") {
 			return "", "", errors.New("use a plain username, DOMAIN\\user, or user@domain")
 		}
-		embeddedDomain, user, _ = strings.Cut(user, `\`)
+		domain, user, _ = strings.Cut(user, `\`)
 	} else if strings.Contains(user, "@") {
 		if strings.Count(user, "@") != 1 {
 			return "", "", errors.New("use a plain username, DOMAIN\\user, or user@domain")
 		}
-		user, embeddedDomain, _ = strings.Cut(user, "@")
+		user, domain, _ = strings.Cut(user, "@")
+	} else {
+		return user, "", nil
 	}
-	if user == "" || strings.TrimSpace(user) != user || strings.TrimSpace(embeddedDomain) != embeddedDomain {
-		return "", "", errors.New("username and embedded domain must be nonempty without surrounding whitespace")
-	}
-	// A separator without a domain is always a malformed qualified identity.
-	if qualified && embeddedDomain == "" {
-		return "", "", errors.New("qualified username must include a domain")
-	}
-	if embeddedDomain != "" {
-		if domain != "" && !strings.EqualFold(domain, embeddedDomain) {
-			return "", "", errors.New("explicit domain conflicts with the qualified username")
-		}
-		domain = embeddedDomain
+	if user == "" || domain == "" || strings.TrimSpace(user) != user || strings.TrimSpace(domain) != domain {
+		return "", "", errors.New("qualified username must include a username and domain without surrounding whitespace")
 	}
 	return user, domain, nil
 }
@@ -395,10 +384,10 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 		}
 	}
 	var summary scanSummary
+	var elapsed time.Duration
 	scanStarted := false
 	progress := newProgress(deps.stderr, showProgress, len(cfg.targets))
 	progress.SetScanBudget(cfg.concurrency, cfg.options.HostTimeout, cfg.delay)
-	pipedProgress := showProgress && !deps.stdoutIsTerminal
 	if !deps.stdoutIsTerminal {
 		progress.UseLines()
 	}
@@ -413,7 +402,7 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 			code = 1
 		}
 		if showProgress && scanStarted {
-			if err := summary.Print(deps.stderr, len(cfg.targets)); err != nil {
+			if err := summary.Print(deps.stderr, len(cfg.targets), elapsed); err != nil {
 				code = 1
 			}
 		}
@@ -449,6 +438,7 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 		return nil
 	}
 	scanStarted = true
+	started := time.Now()
 	scanErr := scanTargets(scanCtx, cfg.targets, cfg.options, cfg.concurrency, cfg.delay, deps.scan, func(result Result, hostCompleted bool) error {
 		result.explicitGuest = cfg.options.Guest
 		summary.Add(result, hostCompleted)
@@ -463,7 +453,8 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 			code = 1
 		}
 		result = redactResult(result, cfg.options.Password)
-		if cfg.json {
+		showResult := !cfg.sharesOnly || len(result.Shares) > 0
+		if cfg.json && showResult {
 			// Keep completed work even if the separate progress stream fails.
 			results = append(results, result)
 		}
@@ -473,7 +464,7 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 		if err := progress.Clear(); err != nil {
 			return handleOutputError(err)
 		}
-		if !cfg.json {
+		if !cfg.json && showResult {
 			if err := writeResult(deps.stdout, result); err != nil {
 				fmt.Fprintln(deps.stderr, "gosmb: could not write output")
 				return handleOutputError(err)
@@ -481,12 +472,11 @@ func runCLI(ctx context.Context, args []string, deps cliDependencies) (code int)
 		}
 		return handleOutputError(progress.Update(summary.completed))
 	})
+	elapsed = time.Since(started)
 	if scanErr != nil {
 		code = 1
-		if ctx.Err() != nil && !pipedProgress {
-			if err := progress.Clear(); err == nil {
-				fmt.Fprintln(deps.stderr, "gosmb: canceled")
-			}
+		if ctx.Err() != nil && !showProgress {
+			fmt.Fprintln(deps.stderr, "gosmb: canceled")
 		}
 	}
 	if cfg.json {

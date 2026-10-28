@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestScanSummaryCountsHostsAndShareFindings(t *testing.T) {
@@ -35,7 +36,7 @@ func TestScanSummaryCountsHostsAndShareFindings(t *testing.T) {
 		{Result{Authentication: "failed", Error: "private-auth-error"}, false},
 		{Result{Authentication: "guest", Enumeration: "ok"}, true},
 	}
-	const want = "Summary: 6/12 hosts completed; 3 interrupted; 3 not started\n" +
+	const want = "Summary: 6/12 hosts completed; 3 interrupted; 3 not started; elapsed 3s; 2.0 hosts/s\n" +
 		"Host outcomes: OK=1 NO_SHARES=1 CONNECT_REFUSED=1 AUTH_FAILED=1 ENUM_PARTIAL=1 CHECK_FAILED=1 CHECK_TIMEOUT=1 CANCELED=2\n" +
 		"Shares: 9 found; 4 readable; 2 writable (metadata)\n"
 	for _, reverse := range []bool{false, true} {
@@ -48,7 +49,7 @@ func TestScanSummaryCountsHostsAndShareFindings(t *testing.T) {
 			summary.Add(attempt.result, attempt.completed)
 		}
 		var out bytes.Buffer
-		if err := summary.Print(&out, 12); err != nil {
+		if err := summary.Print(&out, 12, 3*time.Second); err != nil {
 			t.Fatal(err)
 		}
 		if out.String() != want {
@@ -100,10 +101,10 @@ func TestScanSummaryPreservesStatusPrecedence(t *testing.T) {
 func TestScanSummaryEmptyAndRemainingTargets(t *testing.T) {
 	var summary scanSummary
 	var out bytes.Buffer
-	if err := summary.Print(&out, 3); err != nil {
+	if err := summary.Print(&out, 3, 0); err != nil {
 		t.Fatal(err)
 	}
-	const empty = "Summary: 0/3 hosts completed; 0 interrupted; 3 not started\n" +
+	const empty = "Summary: 0/3 hosts completed; 0 interrupted; 3 not started; elapsed 0s; 0.0 hosts/s\n" +
 		"Host outcomes: none\nShares: 0 found; 0 readable; 0 writable (metadata)\n"
 	if out.String() != empty {
 		t.Fatalf("empty summary invented attempts or outcomes: %q", out.String())
@@ -111,10 +112,10 @@ func TestScanSummaryEmptyAndRemainingTargets(t *testing.T) {
 	summary.Add(Result{Authentication: "guest", Enumeration: "ok"}, true)
 	summary.Add(Result{Authentication: "guest", Enumeration: "ok"}, false)
 	out.Reset()
-	if err := summary.Print(&out, 1); err != nil {
+	if err := summary.Print(&out, 1, time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(out.String(), "Summary: 1/1 hosts completed; 1 interrupted; 0 not started\n") {
+	if !strings.HasPrefix(out.String(), "Summary: 1/1 hosts completed; 1 interrupted; 0 not started; elapsed 1s; 1.0 hosts/s\n") {
 		t.Fatalf("remaining target count was negative: %q", out.String())
 	}
 }
@@ -132,8 +133,37 @@ func TestScanSummaryPropagatesOutputFailures(t *testing.T) {
 			}
 			return 0, io.ErrClosedPipe
 		})
-		if err := summary.Print(out, 1); !errors.Is(err, want) {
+		if err := summary.Print(out, 1, time.Second); !errors.Is(err, want) {
 			t.Fatalf("short=%t: output error=%v; want %v", short, err, want)
 		}
+	}
+}
+
+func TestScanSummaryElapsedAndCompletedRate(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		elapsed time.Duration
+		want    string
+	}{
+		{"zero", 0, "0s; 0.0 hosts/s"},
+		{"negative", -time.Second, "0s; 0.0 hosts/s"},
+		{"fractional", 1500 * time.Millisecond, "1.5s; 0.7 hosts/s"},
+		{"minutes", 83 * time.Second, "1m23s; 0.0 hosts/s"},
+		{"submillisecond", 400 * time.Microsecond, "<1ms; 2500.0 hosts/s"},
+		{"unrounded rate", 1500 * time.Microsecond, "2ms; 666.7 hosts/s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var summary scanSummary
+			summary.Add(Result{Authentication: "guest", Enumeration: "ok"}, true)
+			summary.Add(Result{Authentication: "guest", Enumeration: "ok"}, false)
+			var out bytes.Buffer
+			if err := summary.Print(&out, 3, tc.elapsed); err != nil {
+				t.Fatal(err)
+			}
+			line, _, _ := strings.Cut(out.String(), "\n")
+			if want := "Summary: 1/3 hosts completed; 1 interrupted; 1 not started; elapsed " + tc.want; line != want {
+				t.Fatalf("summary timing=%q; want %q", line, want)
+			}
+		})
 	}
 }

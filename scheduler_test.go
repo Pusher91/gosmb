@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -119,6 +120,55 @@ func schedulerHostFile(t *testing.T, names ...string) string {
 
 func schedulerSuccess(target Target) Result {
 	return Result{Target: target.String(), ServerIP: "192.0.2.1", Reachable: true, Authentication: "authenticated", Enumeration: "ok", Shares: []ShareResult{{Name: target.Host + "-share", Read: Allowed, Write: Denied}}}
+}
+
+func TestCLIDefaultConcurrencyAndSerialOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		hosts, active int
+		flags         []string
+	}{
+		{"default", 43, 40, nil},
+		{"small list", 3, 3, nil},
+		{"serial override", 3, 1, []string{"--concurrency=1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hosts := make([]string, tc.hosts)
+			for i := range hosts {
+				hosts[i] = "host-" + strconv.Itoa(i)
+			}
+			path := schedulerHostFile(t, hosts...)
+			synctest.Test(t, func(t *testing.T) {
+				var out, diagnostics bytes.Buffer
+				deps := testCLIDeps(&out, &diagnostics)
+				started := make(chan struct{}, tc.hosts)
+				release := make(chan struct{})
+				releaseAll := sync.OnceFunc(func() { close(release) })
+				defer releaseAll()
+				deps.scan = func(_ context.Context, target Target, _ Options) Result {
+					started <- struct{}{}
+					<-release
+					return schedulerSuccess(target)
+				}
+				args := append([]string{path, "-u", "alice", "-p", "", "--tsv"}, tc.flags...)
+				done := make(chan int, 1)
+				go func() { done <- runCLI(context.Background(), args, deps) }()
+				// All launched scans are blocked on release, so the initial batch
+				// directly demonstrates the CLI's concurrency bound without timing.
+				synctest.Wait()
+				if got := len(started); got != tc.active {
+					t.Fatalf("started %d hosts before any completed; want %d", got, tc.active)
+				}
+				releaseAll()
+				if code := <-done; code != 0 {
+					t.Fatalf("scan failed: exit=%d stderr=%q", code, diagnostics.String())
+				}
+				if len(started) != tc.hosts || len(parseTestTSV(t, out.String())) != tc.hosts+1 {
+					t.Fatalf("queued hosts or output were lost: started=%d stdout=%q", len(started), out.String())
+				}
+			})
+		})
+	}
 }
 
 func awaitSchedulerStart(t *testing.T, ctx context.Context, started <-chan string) string {
@@ -365,7 +415,7 @@ func TestSchedulerShortOutputStopsQueuedStarts(t *testing.T) {
 		return schedulerSuccess(target)
 	}
 	targets := schedulerHostFile(t, "first", "queued")
-	code := runCLI(context.Background(), []string{targets, "-u", "alice", "-p", "", "--no-header", "--delay=0"}, deps)
+	code := runCLI(context.Background(), []string{targets, "-u", "alice", "-p", "", "--no-header", "--delay=0", "--concurrency=1"}, deps)
 	if code != 1 || calls != 1 {
 		t.Fatalf("short output did not stop queued scans: exit=%d scans=%d", code, calls)
 	}

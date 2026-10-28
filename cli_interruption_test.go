@@ -29,7 +29,7 @@ func TestCLIPipedTableSavesInterruptionSummary(t *testing.T) {
 				return schedulerSuccess(target)
 			}
 			path := schedulerHostFile(t, "first", "second", "queued")
-			code := runCLI(ctx, []string{path, "--guest"}, deps)
+			code := runCLI(ctx, []string{path, "--guest", "--concurrency=1"}, deps)
 			const summary = "Progress: 33% (1/3 hosts completed) (interrupted)\n"
 			if code != 1 || calls != 2 || !strings.HasSuffix(out.String(), summary) || strings.Count(out.String(), "Progress:") != 1 {
 				t.Fatalf("interruption summary missing, duplicated, or miscounted: exit=%d scans=%d output=%q", code, calls, out.String())
@@ -40,6 +40,9 @@ func TestCLIPipedTableSavesInterruptionSummary(t *testing.T) {
 			}
 			if strings.ContainsAny(out.String(), "\r\x1b") || strings.Contains(out.String(), "ETA:") || strings.Contains(diagnostics.String(), "(interrupted)") {
 				t.Fatalf("saved progress controls or duplicate terminal summary: stdout=%q stderr=%q", out.String(), diagnostics.String())
+			}
+			if strings.Contains(diagnostics.String(), "gosmb: canceled") != (mode != "terminal") {
+				t.Fatalf("cancellation diagnostic did not follow progress availability: %q", diagnostics.String())
 			}
 		})
 	}
@@ -71,6 +74,9 @@ func TestCLIInterruptionSummaryPreservesOtherOutputModes(t *testing.T) {
 			}
 			if code != wantCode || strings.Contains(out.String(), "Progress:") || strings.Contains(out.String(), "(interrupted)") {
 				t.Fatalf("changed output format or exit status: exit=%d output=%q", code, out.String())
+			}
+			if strings.Contains(diagnostics.String(), "gosmb: canceled") != (mode == "no-progress") {
+				t.Fatalf("cancellation diagnostic was duplicated or missing without progress: %q", diagnostics.String())
 			}
 			if mode == "json" {
 				var results []Result

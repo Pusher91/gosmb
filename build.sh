@@ -60,8 +60,9 @@ for target in windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 d
     artifacts+=("$filename")
 
     printf 'Building %s/%s...\n' "$platform" "$target_arch"
-    CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch" \
-        go build -trimpath -o "$stage_dir/$filename" .
+    # Tracked binaries must not change just because their Git commit changes.
+    CGO_ENABLED=0 GOWORK=off GOOS="$target_os" GOARCH="$target_arch" \
+        go build -trimpath -buildvcs=false -o "$stage_dir/$filename" .
 done
 
 # Check every destination before replacing any previous binary.

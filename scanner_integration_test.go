@@ -191,8 +191,8 @@ func TestScanTargetShareCleanupStatusControlsExitCode(t *testing.T) {
 				var out, errOut bytes.Buffer
 				deps := testCLIDeps(&out, &errOut)
 				deps.scan = scanTarget
-				code := runCLI(context.Background(), []string{fixture.target.String(), "-u", fixture.options.Username,
-					"-p", fixture.options.Password, "-d", fixture.options.Domain, "--json"}, deps)
+				code := runCLI(context.Background(), []string{fixture.target.String(), "-u", fixture.options.Domain + `\` + fixture.options.Username,
+					"-p", fixture.options.Password, "--json"}, deps)
 				var results []Result
 				if err := json.Unmarshal(out.Bytes(), &results); err != nil || len(results) != 1 {
 					t.Fatalf("invalid JSON report: %q; %v", out.String(), err)

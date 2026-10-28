@@ -173,7 +173,11 @@ func TestAuthenticationDiagnosticsPreserveReportFormat(t *testing.T) {
 			if len(lines) != 2 || len(strings.Fields(lines[0])) != columns || len(strings.Fields(lines[1])) != columns {
 				t.Fatalf("expected one %d-column header and row: %q", columns, out)
 			}
-			if strings.Fields(lines[0])[5] != "STATUS" || strings.Fields(lines[1])[5] != "AUTH_FAILED" {
+			status := "AUTH_FAILED"
+			if format.color {
+				status = "\x1b[31mAUTH_FAILED\x1b[0m"
+			}
+			if strings.Fields(lines[0])[5] != "STATUS" || strings.Fields(lines[1])[5] != status {
 				t.Errorf("authentication failure missing from status: %q", out)
 			}
 			if format.color && !strings.Contains(out, "\x1b[31mFALSE\x1b[0m") {

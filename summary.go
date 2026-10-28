@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 type scanSummary struct {
@@ -40,10 +41,19 @@ func (s *scanSummary) Add(result Result, completed bool) {
 	s.outcomes[outcome]++
 }
 
-func (s *scanSummary) Print(out io.Writer, total int) error {
+func (s *scanSummary) Print(out io.Writer, total int, elapsed time.Duration) error {
+	elapsed = max(0, elapsed)
+	elapsedText := elapsed.Round(time.Millisecond).String()
+	rate := 0.0
+	if elapsed > 0 {
+		rate = float64(s.completed) / elapsed.Seconds()
+		if elapsedText == "0s" {
+			elapsedText = "<1ms"
+		}
+	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Summary: %d/%d hosts completed; %d interrupted; %d not started\n",
-		s.completed, total, s.attempted-s.completed, max(0, total-s.attempted))
+	fmt.Fprintf(&b, "Summary: %d/%d hosts completed; %d interrupted; %d not started; elapsed %s; %.1f hosts/s\n",
+		s.completed, total, s.attempted-s.completed, max(0, total-s.attempted), elapsedText, rate)
 	b.WriteString("Host outcomes:")
 	if s.attempted == 0 {
 		b.WriteString(" none")

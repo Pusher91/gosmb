@@ -223,7 +223,8 @@ func TestCLICIDRScansEachExpandedTargetAndReportsProgress(t *testing.T) {
 					Authentication: "guest", Enumeration: "ok",
 					Shares: []ShareResult{{Name: "data", Read: Allowed, Write: Denied}}}
 			}
-			code := runCLI(context.Background(), []string{input, "--guest", "--delay=0", "--tsv"}, deps)
+			// Use one worker to check expansion order as well as contents.
+			code := runCLI(context.Background(), []string{input, "--guest", "--concurrency=1", "--delay=0", "--tsv"}, deps)
 			want := []Target{{"192.0.2.0", 1445}, {"192.0.2.1", 1445}, {"192.0.2.2", 1445}, {"192.0.2.3", 1445}}
 			if code != 0 || !reflect.DeepEqual(attempted, want) {
 				t.Fatalf("code=%d attempted=%#v; want %#v", code, attempted, want)

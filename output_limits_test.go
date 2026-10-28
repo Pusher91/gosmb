@@ -64,14 +64,15 @@ func TestInteractiveUnicodeAndEscapeBoundaries(t *testing.T) {
 				if err := writeAlignedResult(&out, result, colored); err != nil {
 					t.Fatal(err)
 				}
-				read, denied := "TRUE", "FALSE"
+				read, denied, status := "TRUE", "FALSE", "OK"
 				if colored {
 					read, denied = "\x1b[32mTRUE\x1b[0m", "\x1b[31mFALSE\x1b[0m"
+					status = "\x1b[32mOK\x1b[0m"
 				}
 				// Widths here are known from the test data, independent of the
 				// renderer's Unicode measurement and truncation implementation.
 				want := "192.0.2.1:445" + strings.Repeat(" ", 10) + tc.want + strings.Repeat(" ", 22-tc.columns) +
-					read + "     " + denied + "    " + denied + "    " + "OK" + strings.Repeat(" ", 18) + "fileserver\n"
+					read + "     " + denied + "    " + denied + "    " + status + strings.Repeat(" ", 18) + "fileserver\n"
 				if out.String() != want {
 					t.Errorf("colored=%t: clipped a grapheme/escape or moved a column:\n%q\nwant %q", colored, out.String(), want)
 				}

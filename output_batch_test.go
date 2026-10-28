@@ -19,15 +19,16 @@ func TestAlignedOutputBatchesCompleteRows(t *testing.T) {
 		for _, colored := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/colored=%t", tc.name, colored), func(t *testing.T) {
 				result := Result{Target: tc.hostname + ":445", ServerIP: "192.0.2.25", Authentication: "authenticated", Enumeration: "ok"}
-				read, denied := "TRUE", "FALSE"
+				read, denied, status := "TRUE", "FALSE", "OK"
 				if colored {
 					read, denied = "\x1b[32mTRUE\x1b[0m", "\x1b[31mFALSE\x1b[0m"
+					status = "\x1b[32mOK\x1b[0m"
 				}
 				var expected bytes.Buffer
 				for i := range tc.rows {
 					result.Shares = append(result.Shares, ShareResult{Name: fmt.Sprintf("資料-\t%04d\x1b", i), Read: Allowed, Write: Denied})
-					fmt.Fprintf(&expected, "192.0.2.25:445%s資料-\\t%04d\\x1b%s%s     %s    %s    OK%s%s\n",
-						strings.Repeat(" ", 9), i, strings.Repeat(" ", 7), read, denied, denied, strings.Repeat(" ", 18), tc.hostname)
+					fmt.Fprintf(&expected, "192.0.2.25:445%s資料-\\t%04d\\x1b%s%s     %s    %s    %s%s%s\n",
+						strings.Repeat(" ", 9), i, strings.Repeat(" ", 7), read, denied, denied, status, strings.Repeat(" ", 18), tc.hostname)
 				}
 				rowBytes := expected.Len() / tc.rows
 				var combined bytes.Buffer

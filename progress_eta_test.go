@@ -16,6 +16,7 @@ func TestProgressMaxETAUsesRemainingScanBudget(t *testing.T) {
 		timeout, delay                time.Duration
 		want                          string
 	}{
+		{"large default scan", 5113, 0, 40, 30 * time.Second, 0, "1h04m"},
 		{"user settings", 6067, 0, 40, 30 * time.Second, 250 * time.Millisecond, "1h17m"},
 		{"launch delay dominates", 6067, 0, 40, 5 * time.Second, 250 * time.Millisecond, "25m22s"},
 		{"remaining targets", 6067, 6, 40, 5 * time.Second, 250 * time.Millisecond, "25m21s"},

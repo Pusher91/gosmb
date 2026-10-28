@@ -16,21 +16,23 @@ import (
 )
 
 func TestParseCLIFlagsAfterTarget(t *testing.T) {
-	cfg, err := parseCLI(context.Background(), []string{"server.example:1445", "-u", `EXAMPLE\alice`, "-p", "", "--domain", "example", "--timeout", "7s", "--delay=0", "--json"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.options.Username != "alice" || cfg.options.Domain != "EXAMPLE" || !cfg.passwordSet || cfg.options.Password != "" {
-		t.Fatalf("incorrect explicit credentials: %#v", cfg)
-	}
-	if !cfg.json || cfg.delay != 0 || cfg.options.Timeout != 7*time.Second || !reflect.DeepEqual(cfg.targets, []Target{{Host: "server.example", Port: 1445}}) {
-		t.Fatalf("incorrect options: %#v", cfg)
+	for _, identity := range []string{`EXAMPLE\alice`, "alice@EXAMPLE"} {
+		cfg, err := parseCLI(context.Background(), []string{"server.example:1445", "-u", identity, "-p", "", "--timeout", "7s", "--delay=0", "--json"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.options.Username != "alice" || cfg.options.Domain != "EXAMPLE" || !cfg.passwordSet || cfg.options.Password != "" {
+			t.Fatalf("incorrect explicit credentials: %#v", cfg)
+		}
+		if !cfg.json || cfg.delay != 0 || cfg.options.Timeout != 7*time.Second || !reflect.DeepEqual(cfg.targets, []Target{{Host: "server.example", Port: 1445}}) {
+			t.Fatalf("incorrect options: %#v", cfg)
+		}
 	}
 }
 
 func TestCLIConcurrencyAndHostTimeoutOptions(t *testing.T) {
 	cfg, err := parseCLI(context.Background(), []string{"server", "--guest"})
-	if err != nil || cfg.delay != 0 || cfg.concurrency != 1 || cfg.options.HostTimeout != 30*time.Second || cfg.options.Timeout != 10*time.Second {
+	if err != nil || cfg.delay != 0 || cfg.concurrency != 40 || cfg.options.HostTimeout != 30*time.Second || cfg.options.Timeout != 10*time.Second {
 		t.Fatalf("unexpected scheduler defaults: %#v %v", cfg, err)
 	}
 	for _, args := range [][]string{
@@ -55,19 +57,23 @@ func TestCLIConcurrencyAndHostTimeoutOptions(t *testing.T) {
 }
 
 func TestParseIdentity(t *testing.T) {
-	for _, tt := range []struct{ input, domain, user, wantDomain string }{
-		{"alice", "", "alice", ""},
-		{`EXAMPLE\alice`, "", "alice", "EXAMPLE"},
-		{"alice@example.test", "EXAMPLE.TEST", "alice", "example.test"},
+	for _, tt := range []struct{ input, user, wantDomain string }{
+		{"alice", "alice", ""},
+		{`EXAMPLE\alice`, "alice", "EXAMPLE"},
+		{"alice@example.test", "alice", "example.test"},
 	} {
-		user, domain, err := parseIdentity(tt.input, tt.domain)
+		user, domain, err := parseIdentity(tt.input)
 		if err != nil || user != tt.user || domain != tt.wantDomain {
 			t.Errorf("parseIdentity(%q): %q %q %v", tt.input, user, domain, err)
 		}
 	}
-	for _, tt := range [][2]string{{"", ""}, {`\alice`, ""}, {"alice@", ""}, {"@example", ""}, {`EXAMPLE\alice`, "OTHER"}, {"alice@example", "other"}, {"a@b@c", ""}, {"a\nb", ""}, {" alice", ""}, {"ali\xffce", ""}, {"alice", "dom\xffain"}, {"alice@dom\xffain", ""}} {
-		if _, _, err := parseIdentity(tt[0], tt[1]); err == nil {
-			t.Errorf("accepted malformed/conflicting identity %q", tt)
+	for _, input := range []string{
+		"", `\alice`, `EXAMPLE\`, "alice@", "@example", "a@b@c", `EXAMPLE\alice@example`, `EXAMPLE\alice\extra`,
+		"a\nb", " alice", `EXAMPLE\ alice`, `EXAMPLE \alice`, "alice @example", "alice@ example",
+		"ali\xffce", "dom\xffain\\alice", "alice@dom\xffain",
+	} {
+		if _, _, err := parseIdentity(input); err == nil {
+			t.Errorf("accepted malformed identity %q", input)
 		}
 	}
 }
@@ -312,9 +318,29 @@ func TestCLIRejectsRemovedOptions(t *testing.T) {
 		{"--port=1445", "server", "--guest"},
 		{"--file", "servers.txt", "--guest"},
 		{"--guest", "--file=servers.txt"},
+		{"server", "-u", "alice", "-d", "EXAMPLE"},
+		{"-d=EXAMPLE", "server", "-u", "alice"},
+		{"server", "-u", "alice", "--domain", "EXAMPLE"},
+		{"--domain=EXAMPLE", "server", "-u", "alice"},
+		{"server", "--guest", "-d", "EXAMPLE"},
+		{"server", "--guest", "--domain=EXAMPLE"},
 	} {
 		if _, err := parseCLI(context.Background(), args); err == nil || !strings.Contains(err.Error(), "unknown option") {
 			t.Fatalf("removed option was not rejected: args=%q err=%v", args, err)
+		}
+		var out, diagnostics bytes.Buffer
+		deps := testCLIDeps(&out, &diagnostics)
+		deps.lookupEnv = func(string) (string, bool) { t.Fatal("removed option accessed credentials"); return "", false }
+		deps.prompt = func(context.Context, io.Reader, io.Writer) (string, error) {
+			t.Fatal("removed option prompted for credentials")
+			return "", nil
+		}
+		deps.scan = func(context.Context, Target, Options) Result {
+			t.Fatal("removed option started a scan")
+			return Result{}
+		}
+		if code := runCLI(context.Background(), args, deps); code != 2 || out.Len() != 0 || !strings.Contains(diagnostics.String(), "unknown option") {
+			t.Fatalf("removed option was not rejected before scanning: args=%q exit=%d stdout=%q stderr=%q", args, code, out.String(), diagnostics.String())
 		}
 	}
 }
@@ -326,6 +352,8 @@ func TestCLIInvalidArgumentsDoNotEchoSecrets(t *testing.T) {
 		{"host:" + secret, "-u", "alice"},
 		{"host", "-u", "alice", "--timeout", secret},
 		{"host", "-u", "alice", "--port", secret},
+		{"host", "-u", "alice", "-d", secret},
+		{"host", "-u", "alice", "--domain=" + secret},
 		{"host", "-u", "alice", "--delay", secret},
 		{"--file", secret, "-u", "alice"},
 		{"host", "-u", "alice", "-p", secret, secret},
@@ -485,7 +513,7 @@ func TestCLISequentialOneAttemptAndExitCodes(t *testing.T) {
 		}
 		return result
 	}
-	code := runCLI(context.Background(), []string{path, "-u", "alice", "-p", "secret", "--delay", "0"}, deps)
+	code := runCLI(context.Background(), []string{path, "-u", "alice", "-p", "secret", "--delay", "0", "--concurrency=1"}, deps)
 	if code != 1 || !reflect.DeepEqual(attempted, []string{"first", "second", "third"}) {
 		t.Fatalf("code=%d attempted=%v", code, attempted)
 	}
@@ -664,7 +692,7 @@ func TestGuestFlagsBeforeAndAfterTarget(t *testing.T) {
 }
 
 func TestGuestRejectsEveryExplicitCredentialOption(t *testing.T) {
-	for _, option := range []string{"-u", "--user", "--username", "-p", "--pass", "--password", "-d", "--domain"} {
+	for _, option := range []string{"-u", "--user", "--username", "-p", "--pass", "--password"} {
 		for _, value := range []string{"", "credential-must-not-be-echoed"} {
 			for _, args := range [][]string{
 				{"host", "--guest", option, value},
@@ -844,7 +872,7 @@ func TestCLITerminalAlignsSevenColumnsAcrossServers(t *testing.T) {
 			}
 			return Result{Target: target.String(), ServerIP: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", Reachable: true, Authentication: "guest", GuestFallback: true, Enumeration: "ok", Shares: []ShareResult{{Name: "a longer shared folder", Accessible: Denied, Read: Denied, Write: Denied}}}
 		}
-		args := []string{path, "-u", "alice", "-p", "", "--delay", "0"}
+		args := []string{path, "-u", "alice", "-p", "", "--delay", "0", "--concurrency=1"}
 		wantRows := [][]string{
 			{"192.0.2.1:445", "a", "TRUE", "FALSE", "FALSE", "OK", "first"},
 			{"[ffff:ffff:ffff:ffff…", "a longer shared fol…", "FALSE", "FALSE", "TRUE", "OK", "-"},
@@ -921,7 +949,7 @@ func TestCLIProducesOneTSVHeaderWithStatusesAndNoScanDiagnostics(t *testing.T) {
 					return Result{Target: target.String(), ServerIP: "192.0.2.3", Reachable: true, Authentication: "authenticated", Enumeration: "ok"}
 				}
 			}
-			args := []string{path, "-u", "alice", "-p", "do-not-leak-password", "--delay", "0", "--tsv"}
+			args := []string{path, "-u", "alice", "-p", "do-not-leak-password", "--delay", "0", "--tsv", "--concurrency=1"}
 			want := data
 			switch mode {
 			case "header":
@@ -999,7 +1027,8 @@ func TestCLIStatusColorPolicy(t *testing.T) {
 				t.Fatalf("scan failed: exit=%d stderr=%q", code, diagnostics.String())
 			}
 			if tc.wantColor {
-				if !strings.Contains(out.String(), "\x1b[32mTRUE\x1b[0m") || strings.Count(out.String(), "\x1b[31mFALSE\x1b[0m") != 2 {
+				if !strings.Contains(out.String(), "\x1b[32mTRUE\x1b[0m") || strings.Count(out.String(), "\x1b[31mFALSE\x1b[0m") != 2 ||
+					!strings.Contains(out.String(), "\x1b[32mOK\x1b[0m") {
 					t.Fatalf("terminal statuses were not colored: %q", out.String())
 				}
 			} else if strings.ContainsRune(out.String(), '\x1b') {
@@ -1057,7 +1086,7 @@ func TestCLIStreamsTextBeforeNextHostAndKeepsProgressOffStdout(t *testing.T) {
 				}
 				return Result{Target: target.String(), ServerIP: "192.0.2.1", Reachable: true, Authentication: "authenticated", Enumeration: "ok", Shares: []ShareResult{{Name: target.Host + "-share", Read: Allowed, Write: Denied}}}
 			}
-			args := []string{path, "-u", "alice", "-p", "", "--delay", "0"}
+			args := []string{path, "-u", "alice", "-p", "", "--delay", "0", "--concurrency=1"}
 			if mode.flag != "" {
 				args = append(args, mode.flag)
 			}
@@ -1138,7 +1167,7 @@ func TestCLICancelKeepsCompletedRowsAndDoesNotCountInterruptedHost(t *testing.T)
 				}
 			}}
 		}
-		code := runCLI(ctx, []string{path, "-u", "alice", "-p", "", "--delay", "0"}, deps)
+		code := runCLI(ctx, []string{path, "-u", "alice", "-p", "", "--delay", "0", "--concurrency=1"}, deps)
 		cancel()
 		wantCalls := 1
 		if duringHost {

@@ -19,7 +19,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 DIALECTS = {"SMB2_02": 0x202, "SMB2_10": 0x210, "SMB3_00": 0x300,
             "SMB3_02": 0x302, "SMB3_11": 0x311}
-USER = ["-u", "audit-user", "-d", "LAB", "-p", "validation-password"]
+USER = ["-u", r"LAB\audit-user", "-p", "validation-password"]
 
 
 def run(*args, timeout=120, check=True, **kwargs):
@@ -433,10 +433,10 @@ def scenario(image, binary, dialect, mode, bulk):
         before = run("docker", "exec", name, "/usr/local/bin/gosmb-interop-snapshot").stdout
         cases = [("user", USER, "authenticated")]
         if not bulk:
-            cases.append(("wrong_password", ["-u", "audit-user", "-d", "LAB", "-p", "incorrect"], "failed"))
+            cases.append(("wrong_password", ["-u", r"LAB\audit-user", "-p", "incorrect"], "failed"))
             if mode != "required":
                 cases.extend([
-                    ("mapped_guest", ["-u", "nonexistent-user", "-d", "LAB", "-p", "incorrect"], "guest"),
+                    ("mapped_guest", ["-u", r"LAB\nonexistent-user", "-p", "incorrect"], "guest"),
                     ("explicit_guest", ["--guest"], "guest"),
                 ])
         evidence = []

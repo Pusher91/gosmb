@@ -60,7 +60,7 @@ func TestCLIProgressFailurePreservesBufferedJSON(t *testing.T) {
 				return Result{Target: target.String(), Authentication: "authenticated", Enumeration: "ok",
 					Shares: []ShareResult{{Name: target.Host + "-password-secret", Read: Allowed, Write: Denied}}}
 			}
-			code := runCLI(ctx, []string{path, "-u", "fixture", "-p", "password-secret", "--json", "--delay=0"}, deps)
+			code := runCLI(ctx, []string{path, "-u", "fixture", "-p", "password-secret", "--json", "--delay=0", "--concurrency=1"}, deps)
 			if !failed || code != 1 || scans != tc.wantScans {
 				t.Fatalf("progress failure did not stop the run: failed=%t exit=%d scans=%d; want %d scans", failed, code, scans, tc.wantScans)
 			}

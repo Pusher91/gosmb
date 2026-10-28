@@ -365,12 +365,26 @@ func appendAlignedRow(b *lineOutputBuffer, fields [7]string, colored bool) error
 		}
 		size += len(value) + padding[i]
 		// Style only status columns, after measuring their visible widths.
-		if colored && i >= 2 && i <= 4 {
-			switch value {
-			case "TRUE":
-				colors[i] = "\x1b[32m"
-			case "FALSE":
-				colors[i] = "\x1b[31m"
+		if colored {
+			switch i {
+			case 2, 3, 4:
+				switch value {
+				case "TRUE":
+					colors[i] = "\x1b[32m"
+				case "FALSE":
+					colors[i] = "\x1b[31m"
+				case "UNKNOWN", "TIMEOUT":
+					colors[i] = "\x1b[33m"
+				}
+			case 5:
+				switch {
+				case value == "OK":
+					colors[i] = "\x1b[32m"
+				case strings.HasSuffix(value, "_TIMEOUT"), value == "CANCELED", value == "ENUM_PARTIAL", value == "NO_SHARES":
+					colors[i] = "\x1b[33m"
+				default:
+					colors[i] = "\x1b[31m"
+				}
 			}
 			if colors[i] != "" {
 				size += len(colors[i]) + len(reset)

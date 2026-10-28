@@ -10,14 +10,15 @@ Examples below use `gosmb` as the executable name.
 ## Usage
 
 ```sh
-gosmb servers.txt --guest --concurrency 10 | tee gosmb_guest.out
+gosmb servers.txt --guest | tee gosmb_guest.out
 gosmb fileserver.example.com -u 'EXAMPLE\alice'
 gosmb 192.0.2.0/24 -u alice --json > results.json
 gosmb --help
 ```
 
 Omit `-p` for a hidden password prompt, or set `GOSMB_PASSWORD`.
-`--guest` requires no credentials and cannot be combined with `-u`, `-p`, or `-d`.
+For domain accounts, use `-u 'DOMAIN\user'` or `-u user@domain`.
+`--guest` requires no credentials and cannot be combined with `-u` or `-p`.
 Each host gets one authentication attempt; rejected credentials are not retried.
 
 Targets can be hostnames, IP addresses, CIDRs, or a file containing one target per
@@ -28,11 +29,12 @@ CIDRs include every address. Duplicate endpoints are removed, with a maximum of
 
 | Option | Purpose | Default |
 | --- | --- | --- |
-| `--concurrency N` | Parallel host scans | `1` |
+| `--concurrency N` | Parallel host scans | `40` |
 | `--timeout TIME` | SMB I/O timeout | `10s` |
 | `--host-timeout N` | Whole-host timeout in seconds | `30` |
 | `--delay TIME` | Minimum interval between host starts | `0` |
 | `--tsv` / `--json` | Select an output format | Aligned table |
+| `--shares-only` | Hide hosts with no discovered shares | Show all hosts |
 | `--no-header` | Omit the text header | Header shown |
 | `--no-progress` | Hide progress and summary | Shown on terminal stderr |
 
@@ -59,13 +61,16 @@ Permissions are `TRUE`, `FALSE`, `UNKNOWN`, `TIMEOUT`, or `N/A` for non-disk sha
 The table keeps the same format through pipes and clips long cells except
 `HOSTNAME`. Use `--tsv` for full values or `--json` for detailed errors.
 Text rows stream as hosts finish; JSON is written as one array at the end.
+`--shares-only` filters results in all formats; summary counts and exit codes
+still include every scanned host.
 
 ```sh
 # Filter readable shares using explicit TSV output.
 gosmb servers.txt --guest --tsv --no-header --no-progress | awk -F '\t' '$3 == "TRUE"'
 ```
 
-Progress and totals use terminal stderr. Piped runs show only start/end counts;
+Progress and totals use terminal stderr. The summary includes elapsed time and
+completed hosts/sec. Piped runs show only start/end counts;
 `--no-progress` hides both. Ctrl+C keeps completed rows, but saving the final
 interruption count through `tee` is best effort.
 
@@ -82,5 +87,14 @@ Use the Go toolchain specified in [go.mod](go.mod).
 go test -race ./...
 go vet ./...
 ```
+
+Enable the pre-push check once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The hook rebuilds the code being pushed and blocks stale binaries. If blocked, run
+`./build.sh`, commit `builds/`, and push again.
 
 Optional Docker/Samba checks: [interoperability tests](tests/interop/README.md).
